@@ -21,7 +21,17 @@ const VALID_SANDBOX_COMMANDS: ReadonlyArray<SandboxConfig['command']> = [
   'docker',
   'podman',
   'sandbox-exec',
+  'runsc',
+  'lxc',
+  'windows-native',
 ];
+
+// Sandbox types that don't require a container image
+const NATIVE_SANDBOX_COMMANDS: ReadonlySet<SandboxConfig['command']> = new Set([
+  'sandbox-exec',
+  'lxc',
+  'windows-native',
+]);
 
 function isSandboxCommand(value: string): value is SandboxConfig['command'] {
   return (VALID_SANDBOX_COMMANDS as readonly string[]).includes(value);
@@ -57,8 +67,26 @@ function getSandboxCommand(
         )}`,
       );
     }
+
+    // Platform-specific validation
+    if (sandbox === 'sandbox-exec' && os.platform() !== 'darwin') {
+      throw new FatalSandboxError(
+        `sandbox-exec is only supported on macOS`,
+      );
+    }
+    if (sandbox === 'windows-native' && os.platform() !== 'win32') {
+      throw new FatalSandboxError(
+        `windows-native sandboxing is only supported on Windows`,
+      );
+    }
+
+    // Native sandbox types don't require an external command to exist
+    if (sandbox === 'windows-native' || sandbox === 'lxc') {
+      return sandbox;
+    }
+
     // confirm that specified command exists
-    if (commandExists.sync(sandbox)) {
+    if (commandExists.sync(sandbox === 'runsc' ? 'docker' : sandbox)) {
       return sandbox;
     }
     throw new FatalSandboxError(
@@ -87,6 +115,12 @@ function getSandboxCommand(
   return '';
 }
 
+function isNativeSandboxCommand(
+  command: SandboxConfig['command'],
+): boolean {
+  return NATIVE_SANDBOX_COMMANDS.has(command);
+}
+
 export async function loadSandboxConfig(
   settings: Settings,
   argv: SandboxCliArgs,
@@ -94,9 +128,18 @@ export async function loadSandboxConfig(
   const sandboxOption = argv.sandbox ?? settings.tools?.sandbox;
   const command = getSandboxCommand(sandboxOption);
 
+  if (!command) {
+    return undefined;
+  }
+
+  // Native sandbox types (lxc, sandbox-exec, windows-native) don't require a container image
+  if (isNativeSandboxCommand(command)) {
+    return { command, image: '' };
+  }
+
   const packageJson = await getPackageJson();
   const image =
     process.env['GEMINI_SANDBOX_IMAGE'] ?? packageJson?.config?.sandboxImageUri;
 
-  return command && image ? { command, image } : undefined;
+  return image ? { command, image } : undefined;
 }

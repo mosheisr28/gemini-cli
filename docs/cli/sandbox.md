@@ -50,6 +50,52 @@ Cross-platform sandboxing with complete process isolation.
 **Note**: Requires building the sandbox image locally or using a published image
 from your organization's registry.
 
+### 3. gVisor / runsc (Linux only)
+
+Enhanced container sandboxing using [gVisor](https://gvisor.dev/), which
+intercepts and handles system calls in user space for stronger isolation.
+
+**Requirements**: Docker must be installed and gVisor (`runsc`) must be
+configured as a Docker runtime.
+
+```bash
+gemini --sandbox runsc -p "analyze the code"
+```
+
+### 4. LXC (Linux Containers)
+
+Sandboxing within a pre-existing, user-managed LXC container using `lxc exec`.
+Unlike Docker/Podman, LXC does not create a new container per session — it
+executes commands inside a running container you manage.
+
+**Requirements**: LXC must be installed and a container must already exist and
+be running.
+
+```bash
+# Create and start an LXC container (one-time setup)
+lxc launch ubuntu:22.04 gemini-cli
+lxc exec gemini-cli -- npm install -g @google/gemini-cli
+
+# Run with LXC sandbox
+export GEMINI_LXC_CONTAINER=gemini-cli
+gemini --sandbox lxc -p "run the tests"
+```
+
+### 5. Windows Native / TrusteeOS (Windows only)
+
+Native Windows sandboxing using Windows Access Control Lists (ACLs) and the
+Windows trustee model. This applies file system restrictions using `icacls.exe`
+to deny access to sensitive paths, providing OS-level isolation without
+requiring a container runtime.
+
+**Requirements**: Windows OS only. No additional software needed.
+
+```bash
+# Restrict access to specific paths
+set GEMINI_SANDBOX_FORBIDDEN_PATHS=C:\Users\secret;C:\sensitive-data
+gemini --sandbox windows-native -p "analyze the code"
+```
+
 ## Quickstart
 
 ```bash
@@ -73,7 +119,7 @@ gemini -p "run the test suite"
 ### Enable sandboxing (in order of precedence)
 
 1. **Command flag**: `-s` or `--sandbox`
-2. **Environment variable**: `GEMINI_SANDBOX=true|docker|podman|sandbox-exec`
+2. **Environment variable**: `GEMINI_SANDBOX=true|docker|podman|sandbox-exec|runsc|lxc|windows-native`
 3. **Settings file**: `"sandbox": true` in the `tools` object of your
    `settings.json` file (e.g., `{"tools": {"sandbox": true}}`).
 
@@ -117,6 +163,22 @@ permissions with:
 export SANDBOX_SET_UID_GID=true   # Force host UID/GID
 export SANDBOX_SET_UID_GID=false  # Disable UID/GID mapping
 ```
+
+## LXC configuration
+
+| Variable | Description |
+|----------|-------------|
+| `GEMINI_LXC_CONTAINER` | LXC container name (default: `gemini-cli`) |
+
+## Windows Native (TrusteeOS) configuration
+
+| Variable | Description |
+|----------|-------------|
+| `GEMINI_SANDBOX_FORBIDDEN_PATHS` | Semicolon-separated list of paths to deny access to |
+
+The Windows native sandbox applies `DENY` ACEs (Access Control Entries) to
+specified paths using `icacls.exe`. Restrictions are automatically removed when
+the session ends.
 
 ## Troubleshooting
 
