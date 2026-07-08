@@ -68,6 +68,7 @@ const mockExecSync = vi.mocked(execSync);
 const mockSpawn = vi.mocked(spawn);
 const mockPlatform = vi.mocked(os.platform);
 const mockExistsSync = vi.mocked(fs.existsSync);
+const mockRealpathSync = vi.mocked(fs.realpathSync);
 
 function createFakeChildProcess(): ChildProcess {
   return new EventEmitter() as unknown as ChildProcess;
@@ -81,6 +82,8 @@ describe('start_sandbox', () => {
     vi.resetAllMocks();
     mockPlatform.mockReturnValue('linux');
     mockExistsSync.mockReturnValue(false);
+    // Identity by default: no symlink resolution unless a test overrides it.
+    mockRealpathSync.mockImplementation((p) => p as string);
     vi.spyOn(console, 'error').mockImplementation(() => {});
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -353,6 +356,138 @@ describe('start_sandbox', () => {
       await expect(start_sandbox(winConfig)).rejects.toThrow(
         /Failed to determine current user/,
       );
+    });
+
+    describe('symlink defense', () => {
+      it('restricts both a symlinked forbidden path and its real target', async () => {
+        mockPlatform.mockReturnValue('win32');
+        mockExistsSync.mockImplementation((p) => p === 'C:\\secret-link');
+        mockRealpathSync.mockImplementation((p) =>
+          p === 'C:\\secret-link' ? 'C:\\real-secret' : (p as string),
+        );
+        vi.stubEnv('GEMINI_SANDBOX_FORBIDDEN_PATHS', 'C:\\secret-link');
+        mockExecSync.mockImplementation((cmd) => {
+          if (cmd === 'whoami') {
+            return Buffer.from('DOMAIN\\user');
+          }
+          return Buffer.from('');
+        });
+
+        const fakeChild = createFakeChildProcess();
+        mockSpawn.mockReturnValue(fakeChild);
+
+        const resultPromise = start_sandbox(winConfig, [], undefined, CLI_ARGS);
+        fakeChild.emit('close', 0);
+        await resultPromise;
+
+        // The symlink itself is restricted...
+        expect(mockExecSync).toHaveBeenCalledWith(
+          expect.stringContaining(
+            'icacls "C:\\secret-link" /deny "DOMAIN\\user:(OI)(CI)F" /T /Q',
+          ),
+          expect.anything(),
+        );
+        // ...and so is the real target it resolves to, closing the bypass.
+        expect(mockExecSync).toHaveBeenCalledWith(
+          expect.stringContaining(
+            'icacls "C:\\real-secret" /deny "DOMAIN\\user:(OI)(CI)F" /T /Q',
+          ),
+          expect.anything(),
+        );
+        vi.unstubAllEnvs();
+      });
+
+      it('restores ACLs on both the symlink and its real target on exit', async () => {
+        mockPlatform.mockReturnValue('win32');
+        mockExistsSync.mockReturnValue(true);
+        mockRealpathSync.mockImplementation((p) =>
+          p === 'C:\\secret-link' ? 'C:\\real-secret' : (p as string),
+        );
+        vi.stubEnv('GEMINI_SANDBOX_FORBIDDEN_PATHS', 'C:\\secret-link');
+        mockExecSync.mockImplementation((cmd) => {
+          if (cmd === 'whoami') {
+            return Buffer.from('DOMAIN\\user');
+          }
+          return Buffer.from('');
+        });
+
+        const fakeChild = createFakeChildProcess();
+        mockSpawn.mockReturnValue(fakeChild);
+
+        const resultPromise = start_sandbox(winConfig, [], undefined, CLI_ARGS);
+        fakeChild.emit('close', 0);
+        await resultPromise;
+
+        expect(mockExecSync).toHaveBeenCalledWith(
+          expect.stringContaining(
+            'icacls "C:\\secret-link" /remove:d "DOMAIN\\user" /T /Q',
+          ),
+          expect.anything(),
+        );
+        expect(mockExecSync).toHaveBeenCalledWith(
+          expect.stringContaining(
+            'icacls "C:\\real-secret" /remove:d "DOMAIN\\user" /T /Q',
+          ),
+          expect.anything(),
+        );
+        vi.unstubAllEnvs();
+      });
+
+      it('does not duplicate restriction calls when the path is not a symlink', async () => {
+        mockPlatform.mockReturnValue('win32');
+        mockExistsSync.mockImplementation((p) => p === 'C:\\secret');
+        // realpathSync resolves to the identical path (default beforeEach behavior)
+        vi.stubEnv('GEMINI_SANDBOX_FORBIDDEN_PATHS', 'C:\\secret');
+        mockExecSync.mockImplementation((cmd) => {
+          if (cmd === 'whoami') {
+            return Buffer.from('DOMAIN\\user');
+          }
+          return Buffer.from('');
+        });
+
+        const fakeChild = createFakeChildProcess();
+        mockSpawn.mockReturnValue(fakeChild);
+
+        const resultPromise = start_sandbox(winConfig, [], undefined, CLI_ARGS);
+        fakeChild.emit('close', 0);
+        await resultPromise;
+
+        const denyCalls = mockExecSync.mock.calls.filter(
+          ([cmd]) => typeof cmd === 'string' && cmd.includes('/deny'),
+        );
+        expect(denyCalls).toHaveLength(1);
+        vi.unstubAllEnvs();
+      });
+
+      it('still restricts the literal path when realpathSync throws', async () => {
+        mockPlatform.mockReturnValue('win32');
+        mockExistsSync.mockImplementation((p) => p === 'C:\\secret');
+        mockRealpathSync.mockImplementation(() => {
+          throw new Error('cannot resolve');
+        });
+        vi.stubEnv('GEMINI_SANDBOX_FORBIDDEN_PATHS', 'C:\\secret');
+        mockExecSync.mockImplementation((cmd) => {
+          if (cmd === 'whoami') {
+            return Buffer.from('DOMAIN\\user');
+          }
+          return Buffer.from('');
+        });
+
+        const fakeChild = createFakeChildProcess();
+        mockSpawn.mockReturnValue(fakeChild);
+
+        const resultPromise = start_sandbox(winConfig, [], undefined, CLI_ARGS);
+        fakeChild.emit('close', 0);
+        await resultPromise;
+
+        expect(mockExecSync).toHaveBeenCalledWith(
+          expect.stringContaining(
+            'icacls "C:\\secret" /deny "DOMAIN\\user:(OI)(CI)F" /T /Q',
+          ),
+          expect.anything(),
+        );
+        vi.unstubAllEnvs();
+      });
     });
   });
 });

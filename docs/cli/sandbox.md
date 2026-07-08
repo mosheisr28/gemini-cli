@@ -96,6 +96,14 @@ set GEMINI_SANDBOX_FORBIDDEN_PATHS=C:\Users\secret;C:\sensitive-data
 gemini --sandbox windows-native -p "analyze the code"
 ```
 
+**Symlink resolution**: Each forbidden path is resolved with `fs.realpathSync`
+before the `DENY` ACE is applied. If a forbidden path is a symlink (or
+junction/reparse point), both the symlink itself **and** its real target are
+restricted — this prevents a symlink from being used to reach the same
+underlying file or directory without triggering the restriction. See
+[Security notes](#security-notes) for the current scope and known limitations of
+this protection.
+
 ## Quickstart
 
 ```bash
@@ -119,7 +127,8 @@ gemini -p "run the test suite"
 ### Enable sandboxing (in order of precedence)
 
 1. **Command flag**: `-s` or `--sandbox`
-2. **Environment variable**: `GEMINI_SANDBOX=true|docker|podman|sandbox-exec|runsc|lxc|windows-native`
+2. **Environment variable**:
+   `GEMINI_SANDBOX=true|docker|podman|sandbox-exec|runsc|lxc|windows-native`
 3. **Settings file**: `"sandbox": true` in the `tools` object of your
    `settings.json` file (e.g., `{"tools": {"sandbox": true}}`).
 
@@ -166,19 +175,26 @@ export SANDBOX_SET_UID_GID=false  # Disable UID/GID mapping
 
 ## LXC configuration
 
-| Variable | Description |
-|----------|-------------|
+| Variable               | Description                                |
+| ---------------------- | ------------------------------------------ |
 | `GEMINI_LXC_CONTAINER` | LXC container name (default: `gemini-cli`) |
 
 ## Windows Native (TrusteeOS) configuration
 
-| Variable | Description |
-|----------|-------------|
+| Variable                         | Description                                         |
+| -------------------------------- | --------------------------------------------------- |
 | `GEMINI_SANDBOX_FORBIDDEN_PATHS` | Semicolon-separated list of paths to deny access to |
 
 The Windows native sandbox applies `DENY` ACEs (Access Control Entries) to
 specified paths using `icacls.exe`. Restrictions are automatically removed when
 the session ends.
+
+Before applying a restriction, each forbidden path is resolved with
+`fs.realpathSync`. If the resolved real path differs from the path you specified
+(i.e. it is a symlink or junction), the sandbox restricts **both** paths, so
+pointing a symlink at a forbidden directory does not bypass the restriction.
+This mirrors, at a smaller scope, the symlink-resolution approach used for the
+workspace-trust boundary in other sandbox backends.
 
 ## Troubleshooting
 
@@ -225,6 +241,37 @@ gemini -s -p "run shell command: mount | grep workspace"
 - Use the most restrictive profile that allows your work.
 - Container overhead is minimal after first build.
 - GUI applications may not work in sandboxes.
+
+### Known limitations of runsc, lxc, and windows-native
+
+The `runsc`, `lxc`, and `windows-native` sandbox types are independent,
+lighter-weight implementations and have **not** been validated against a real
+Windows/LXC/gVisor environment as part of this change (this fork's CI does not
+have such runners). Before relying on them for untrusted or adversarial input,
+be aware of the following:
+
+- **windows-native**: Restricts only the paths listed in
+  `GEMINI_SANDBOX_FORBIDDEN_PATHS`, resolved through one level of symlink/
+  junction indirection (see
+  [Windows Native configuration](#windows-native-trusteeos-configuration)
+  above). It does not implement process-level integrity labeling (e.g. Low
+  Mandatory Integrity Level), does not sandbox network access, and does not
+  restrict the _workspace_ — it is a deny-list, not a default-deny sandbox.
+  Treat it as a defense-in-depth layer, not a substitute for running untrusted
+  code in a VM or container.
+- **lxc**: Executes inside a container you create and manage yourself; the
+  strength of the isolation is entirely determined by how that container is
+  configured (LXC's own confinement, not something this integration adds on
+  top). Mounted directories other than the workdir are best-effort read-only and
+  rely on the LXC container's own enforcement of `readonly=true`.
+- **runsc**: Reuses the existing Docker/Podman code path with `--runtime=runsc`
+  added; it inherits the same volume-mount and environment-forwarding behavior
+  as the standard Docker sandbox, so review that section's security notes as
+  well.
+
+If you need stronger, more thoroughly audited platform-native sandboxing,
+consider using Docker/Podman or macOS Seatbelt, which have broader real-world
+usage and testing within this project.
 
 ## Related documentation
 

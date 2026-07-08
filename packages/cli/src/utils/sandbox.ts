@@ -1187,20 +1187,44 @@ async function start_windows_native_sandbox(
       .map((p) => p.trim())
       .filter(Boolean);
 
+    // Resolve symlinks before restricting: icacls acts on the path it is
+    // given, so restricting only a symlink leaves its real target (and any
+    // other symlink pointing at that same target) fully accessible. Restrict
+    // both the literal path and its resolved real path so a symlink cannot
+    // be used to bypass the DENY ACE.
+    const pathsToRestrict = new Set<string>();
     for (const forbiddenPath of forbiddenPaths) {
-      if (fs.existsSync(forbiddenPath)) {
-        try {
-          execSync(
-            `icacls "${forbiddenPath}" /deny "${currentUser}:(OI)(CI)F" /T /Q`,
-            { stdio: 'pipe' },
+      if (!fs.existsSync(forbiddenPath)) {
+        continue;
+      }
+      pathsToRestrict.add(forbiddenPath);
+      try {
+        const realPath = fs.realpathSync(forbiddenPath);
+        if (realPath !== forbiddenPath) {
+          console.error(
+            `Note: '${forbiddenPath}' resolves to '${realPath}'; restricting both paths.`,
           );
-          appliedRestrictions.push(forbiddenPath);
-          console.error(`Restricted access to: ${forbiddenPath}`);
-        } catch {
-          console.warn(
-            `Warning: Could not apply ACL restriction to ${forbiddenPath}`,
-          );
+          pathsToRestrict.add(realPath);
         }
+      } catch {
+        console.warn(
+          `Warning: Could not resolve real path for ${forbiddenPath}`,
+        );
+      }
+    }
+
+    for (const restrictedPath of pathsToRestrict) {
+      try {
+        execSync(
+          `icacls "${restrictedPath}" /deny "${currentUser}:(OI)(CI)F" /T /Q`,
+          { stdio: 'pipe' },
+        );
+        appliedRestrictions.push(restrictedPath);
+        console.error(`Restricted access to: ${restrictedPath}`);
+      } catch {
+        console.warn(
+          `Warning: Could not apply ACL restriction to ${restrictedPath}`,
+        );
       }
     }
 
