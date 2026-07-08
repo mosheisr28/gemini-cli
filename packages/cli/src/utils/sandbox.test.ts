@@ -7,7 +7,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import type { ChildProcess } from 'node:child_process';
-import { execSync, spawn } from 'node:child_process';
+import { execSync, execFileSync, spawn } from 'node:child_process';
 import os from 'node:os';
 import fs from 'node:fs';
 import type { Config, SandboxConfig } from '@google/gemini-cli-core';
@@ -19,6 +19,7 @@ vi.mock('node:child_process', async (importOriginal) => {
   const overrides = {
     exec: vi.fn(),
     execSync: vi.fn(),
+    execFileSync: vi.fn(),
     spawn: vi.fn(),
   };
   return {
@@ -34,6 +35,7 @@ vi.mock('node:fs', async (importOriginal) => {
     existsSync: vi.fn(),
     mkdirSync: vi.fn(),
     writeFileSync: vi.fn(),
+    unlinkSync: vi.fn(),
     realpathSync: vi.fn((p: string) => p),
   };
   return {
@@ -65,6 +67,7 @@ vi.mock('../ui/utils/ConsolePatcher.js', () => ({
 }));
 
 const mockExecSync = vi.mocked(execSync);
+const mockExecFileSync = vi.mocked(execFileSync);
 const mockSpawn = vi.mocked(spawn);
 const mockPlatform = vi.mocked(os.platform);
 const mockExistsSync = vi.mocked(fs.existsSync);
@@ -99,9 +102,25 @@ describe('start_sandbox', () => {
   describe('lxc', () => {
     const lxcConfig: SandboxConfig = { command: 'lxc', image: '' };
 
+    // Default: container exists and is running, for tests that don't care
+    // about the `lxc list` check itself.
+    function mockRunningContainer(containerName = 'gemini-cli') {
+      mockExecFileSync.mockImplementation((cmd, args) => {
+        if (
+          cmd === 'lxc' &&
+          Array.isArray(args) &&
+          args[0] === 'list' &&
+          args[1] === containerName
+        ) {
+          return Buffer.from('RUNNING');
+        }
+        return Buffer.from('');
+      });
+    }
+
     it('throws a FatalSandboxError when the container is not running', async () => {
-      mockExecSync.mockImplementation((cmd) => {
-        if (typeof cmd === 'string' && cmd.startsWith('lxc list')) {
+      mockExecFileSync.mockImplementation((cmd, args) => {
+        if (cmd === 'lxc' && Array.isArray(args) && args[0] === 'list') {
           return Buffer.from('NAME,STATE\ngemini-cli,STOPPED\n');
         }
         return Buffer.from('');
@@ -111,8 +130,8 @@ describe('start_sandbox', () => {
     });
 
     it('throws a FatalSandboxError when the container does not exist', async () => {
-      mockExecSync.mockImplementation((cmd) => {
-        if (typeof cmd === 'string' && cmd.startsWith('lxc list')) {
+      mockExecFileSync.mockImplementation((cmd, args) => {
+        if (cmd === 'lxc' && Array.isArray(args) && args[0] === 'list') {
           throw new Error('not found');
         }
         return Buffer.from('');
@@ -123,13 +142,7 @@ describe('start_sandbox', () => {
 
     it('uses GEMINI_LXC_CONTAINER to select the container name', async () => {
       vi.stubEnv('GEMINI_LXC_CONTAINER', 'my-custom-container');
-      mockExecSync.mockImplementation((cmd) => {
-        if (typeof cmd === 'string' && cmd.startsWith('lxc list')) {
-          expect(cmd).toContain('my-custom-container');
-          return Buffer.from('RUNNING');
-        }
-        return Buffer.from('');
-      });
+      mockRunningContainer('my-custom-container');
 
       const fakeChild = createFakeChildProcess();
       mockSpawn.mockReturnValue(fakeChild);
@@ -138,16 +151,15 @@ describe('start_sandbox', () => {
       fakeChild.emit('close', 0);
 
       await expect(resultPromise).resolves.toBe(0);
+      expect(mockExecFileSync).toHaveBeenCalledWith(
+        'lxc',
+        expect.arrayContaining(['list', 'my-custom-container']),
+      );
       vi.unstubAllEnvs();
     });
 
     it('mounts the workdir and spawns lxc exec with the expected args', async () => {
-      mockExecSync.mockImplementation((cmd) => {
-        if (typeof cmd === 'string' && cmd.startsWith('lxc list')) {
-          return Buffer.from('RUNNING');
-        }
-        return Buffer.from('');
-      });
+      mockRunningContainer();
 
       const fakeChild = createFakeChildProcess();
       mockSpawn.mockReturnValue(fakeChild);
@@ -157,23 +169,49 @@ describe('start_sandbox', () => {
       const code = await resultPromise;
 
       expect(code).toBe(0);
-      expect(mockExecSync).toHaveBeenCalledWith(
-        expect.stringContaining('lxc config device add gemini-cli'),
+      expect(mockExecFileSync).toHaveBeenCalledWith(
+        'lxc',
+        expect.arrayContaining(['config', 'device', 'add', 'gemini-cli']),
       );
       expect(mockSpawn).toHaveBeenCalledWith(
         'lxc',
-        expect.arrayContaining(['exec', 'gemini-cli', '--']),
+        expect.arrayContaining(['exec', 'gemini-cli']),
         { stdio: 'inherit' },
       );
     });
 
+    it('places all lxc exec flags before the -- command delimiter', async () => {
+      mockRunningContainer();
+      vi.stubEnv('GEMINI_API_KEY', 'test-key');
+
+      const fakeChild = createFakeChildProcess();
+      mockSpawn.mockReturnValue(fakeChild);
+
+      const resultPromise = start_sandbox(lxcConfig, [], undefined, CLI_ARGS);
+      fakeChild.emit('close', 0);
+      await resultPromise;
+
+      const spawnArgs = mockSpawn.mock.calls.find(
+        ([cmd]) => cmd === 'lxc',
+      )?.[1] as string[];
+      expect(spawnArgs).toBeDefined();
+
+      const dashDashIndex = spawnArgs.indexOf('--');
+      const envIndex = spawnArgs.indexOf('--env');
+      const cwdIndex = spawnArgs.indexOf('--cwd');
+
+      expect(dashDashIndex).toBeGreaterThan(-1);
+      expect(envIndex).toBeGreaterThan(-1);
+      expect(cwdIndex).toBeGreaterThan(-1);
+      // All flags must come strictly before the -- delimiter, or lxc treats
+      // them as part of the in-container command instead of lxc exec flags.
+      expect(envIndex).toBeLessThan(dashDashIndex);
+      expect(cwdIndex).toBeLessThan(dashDashIndex);
+      vi.unstubAllEnvs();
+    });
+
     it('resolves with the spawned process exit code', async () => {
-      mockExecSync.mockImplementation((cmd) => {
-        if (typeof cmd === 'string' && cmd.startsWith('lxc list')) {
-          return Buffer.from('RUNNING');
-        }
-        return Buffer.from('');
-      });
+      mockRunningContainer();
 
       const fakeChild = createFakeChildProcess();
       mockSpawn.mockReturnValue(fakeChild);
@@ -185,12 +223,7 @@ describe('start_sandbox', () => {
     });
 
     it('removes mounted devices when the process closes', async () => {
-      mockExecSync.mockImplementation((cmd) => {
-        if (typeof cmd === 'string' && cmd.startsWith('lxc list')) {
-          return Buffer.from('RUNNING');
-        }
-        return Buffer.from('');
-      });
+      mockRunningContainer();
 
       const fakeChild = createFakeChildProcess();
       mockSpawn.mockReturnValue(fakeChild);
@@ -199,18 +232,14 @@ describe('start_sandbox', () => {
       fakeChild.emit('close', 0);
       await resultPromise;
 
-      expect(mockExecSync).toHaveBeenCalledWith(
-        expect.stringContaining('lxc config device remove gemini-cli'),
+      expect(mockExecFileSync).toHaveBeenCalledWith(
+        'lxc',
+        expect.arrayContaining(['config', 'device', 'remove', 'gemini-cli']),
       );
     });
 
     it('mounts additional workspace directories as read-only', async () => {
-      mockExecSync.mockImplementation((cmd) => {
-        if (typeof cmd === 'string' && cmd.startsWith('lxc list')) {
-          return Buffer.from('RUNNING');
-        }
-        return Buffer.from('');
-      });
+      mockRunningContainer();
       mockExistsSync.mockReturnValue(true);
 
       const fakeChild = createFakeChildProcess();
@@ -232,10 +261,35 @@ describe('start_sandbox', () => {
       fakeChild.emit('close', 0);
       await resultPromise;
 
-      expect(mockExecSync).toHaveBeenCalledWith(
-        expect.stringContaining(
-          'source=/extra/dir path=/extra/dir readonly=true',
-        ),
+      expect(mockExecFileSync).toHaveBeenCalledWith(
+        'lxc',
+        expect.arrayContaining([
+          'source=/extra/dir',
+          'path=/extra/dir',
+          'readonly=true',
+        ]),
+      );
+    });
+
+    it('preserves paths containing spaces as single arguments (no shell splitting)', async () => {
+      mockRunningContainer();
+
+      const fakeChild = createFakeChildProcess();
+      mockSpawn.mockReturnValue(fakeChild);
+      const spacedWorkdir = '/home/me/my project';
+      vi.spyOn(process, 'cwd').mockReturnValue(spacedWorkdir);
+
+      const resultPromise = start_sandbox(lxcConfig, [], undefined, CLI_ARGS);
+      fakeChild.emit('close', 0);
+      await resultPromise;
+
+      // The whole `source=<path with spaces>` string must arrive as ONE
+      // execFileSync argument (execFileSync bypasses the shell, so no
+      // splitting/interpretation occurs even though the path contains a
+      // space).
+      expect(mockExecFileSync).toHaveBeenCalledWith(
+        'lxc',
+        expect.arrayContaining([`source=${spacedWorkdir}`]),
       );
     });
   });
@@ -317,7 +371,7 @@ describe('start_sandbox', () => {
       vi.unstubAllEnvs();
     });
 
-    it('restores ACLs for restricted paths when the process closes', async () => {
+    it('snapshots ACLs before restricting and restores the exact snapshot on close', async () => {
       mockPlatform.mockReturnValue('win32');
       mockExistsSync.mockReturnValue(true);
       vi.stubEnv('GEMINI_SANDBOX_FORBIDDEN_PATHS', 'C:\\secret');
@@ -335,12 +389,89 @@ describe('start_sandbox', () => {
       fakeChild.emit('close', 0);
       await resultPromise;
 
-      expect(mockExecSync).toHaveBeenCalledWith(
-        expect.stringContaining(
-          'icacls "C:\\secret" /remove:d "DOMAIN\\user" /T /Q',
-        ),
-        expect.anything(),
+      const calls = mockExecSync.mock.calls.map(([cmd]) => cmd as string);
+      const saveCall = calls.find((c) =>
+        c.startsWith('icacls "C:\\secret" /save'),
       );
+      const restoreCall = calls.find((c) =>
+        c.startsWith('icacls "C:\\secret" /restore'),
+      );
+      expect(saveCall).toBeDefined();
+      expect(restoreCall).toBeDefined();
+
+      // The restore must replay the exact backup file that was saved for
+      // this path — not blanket-remove all deny ACEs for the user, which
+      // would also strip any pre-existing deny rules unrelated to this
+      // sandbox session.
+      const backupFile = saveCall!.match(/\/save "([^"]+)"/)?.[1];
+      expect(backupFile).toBeTruthy();
+      expect(restoreCall).toContain(`/restore "${backupFile}"`);
+      expect(calls.some((c) => c.includes('/remove:d'))).toBe(false);
+      vi.unstubAllEnvs();
+    });
+
+    it('skips restricting a path when its ACLs cannot be snapshotted', async () => {
+      mockPlatform.mockReturnValue('win32');
+      mockExistsSync.mockReturnValue(true);
+      vi.stubEnv('GEMINI_SANDBOX_FORBIDDEN_PATHS', 'C:\\secret');
+      mockExecSync.mockImplementation((cmd) => {
+        const cmdStr = cmd as string;
+        if (cmdStr === 'whoami') {
+          return Buffer.from('DOMAIN\\user');
+        }
+        if (cmdStr.includes('/save')) {
+          throw new Error('cannot save ACLs');
+        }
+        return Buffer.from('');
+      });
+
+      const fakeChild = createFakeChildProcess();
+      mockSpawn.mockReturnValue(fakeChild);
+
+      const resultPromise = start_sandbox(winConfig, [], undefined, CLI_ARGS);
+      fakeChild.emit('close', 0);
+      await resultPromise;
+
+      const calls = mockExecSync.mock.calls.map(([cmd]) => cmd as string);
+      // Since the snapshot failed, we must not apply a restriction we can't
+      // safely undo.
+      expect(calls.some((c) => c.includes('/deny'))).toBe(false);
+      vi.unstubAllEnvs();
+    });
+
+    it('does not restore ACLs immediately on SIGINT, only once the child actually closes', async () => {
+      mockPlatform.mockReturnValue('win32');
+      mockExistsSync.mockReturnValue(true);
+      vi.stubEnv('GEMINI_SANDBOX_FORBIDDEN_PATHS', 'C:\\secret');
+      mockExecSync.mockImplementation((cmd) => {
+        if (cmd === 'whoami') {
+          return Buffer.from('DOMAIN\\user');
+        }
+        return Buffer.from('');
+      });
+
+      const fakeChild = createFakeChildProcess();
+      mockSpawn.mockReturnValue(fakeChild);
+
+      const resultPromise = start_sandbox(winConfig, [], undefined, CLI_ARGS);
+
+      // Simulate the user pressing Ctrl+C: the interactive child may
+      // legitimately keep running (e.g. showing a cancel prompt), so the
+      // ACL restore must NOT happen yet.
+      process.emit('SIGINT');
+      const callsAfterSigint = mockExecSync.mock.calls.filter(([cmd]) =>
+        (cmd as string).includes('/restore'),
+      );
+      expect(callsAfterSigint).toHaveLength(0);
+
+      // Only once the child actually closes should the restore happen.
+      fakeChild.emit('close', 130);
+      await resultPromise;
+
+      const callsAfterClose = mockExecSync.mock.calls.filter(([cmd]) =>
+        (cmd as string).includes('/restore'),
+      );
+      expect(callsAfterClose.length).toBeGreaterThan(0);
       vi.unstubAllEnvs();
     });
 
@@ -397,7 +528,7 @@ describe('start_sandbox', () => {
         vi.unstubAllEnvs();
       });
 
-      it('restores ACLs on both the symlink and its real target on exit', async () => {
+      it('snapshots and restores ACLs on both the symlink and its real target', async () => {
         mockPlatform.mockReturnValue('win32');
         mockExistsSync.mockReturnValue(true);
         mockRealpathSync.mockImplementation((p) =>
@@ -418,18 +549,20 @@ describe('start_sandbox', () => {
         fakeChild.emit('close', 0);
         await resultPromise;
 
-        expect(mockExecSync).toHaveBeenCalledWith(
-          expect.stringContaining(
-            'icacls "C:\\secret-link" /remove:d "DOMAIN\\user" /T /Q',
-          ),
-          expect.anything(),
-        );
-        expect(mockExecSync).toHaveBeenCalledWith(
-          expect.stringContaining(
-            'icacls "C:\\real-secret" /remove:d "DOMAIN\\user" /T /Q',
-          ),
-          expect.anything(),
-        );
+        const calls = mockExecSync.mock.calls.map(([cmd]) => cmd as string);
+        expect(
+          calls.some((c) => c.startsWith('icacls "C:\\secret-link" /save')),
+        ).toBe(true);
+        expect(
+          calls.some((c) => c.startsWith('icacls "C:\\secret-link" /restore')),
+        ).toBe(true);
+        expect(
+          calls.some((c) => c.startsWith('icacls "C:\\real-secret" /save')),
+        ).toBe(true);
+        expect(
+          calls.some((c) => c.startsWith('icacls "C:\\real-secret" /restore')),
+        ).toBe(true);
+        expect(calls.some((c) => c.includes('/remove:d'))).toBe(false);
         vi.unstubAllEnvs();
       });
 

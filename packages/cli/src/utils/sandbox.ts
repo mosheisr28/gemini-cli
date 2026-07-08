@@ -4,7 +4,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { exec, execSync, spawn, type ChildProcess } from 'node:child_process';
+import {
+  exec,
+  execSync,
+  execFileSync,
+  spawn,
+  type ChildProcess,
+} from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -376,6 +382,13 @@ export async function start_sandbox(
     const workdir = path.resolve(process.cwd());
     const containerWorkdir = getContainerPath(workdir);
 
+    // For runsc, use docker as the underlying container command. This must be
+    // computed before the BUILD_SANDBOX block below: runsc is a container
+    // *runtime* (selected via `docker run --runtime=runsc`), not an
+    // image-building CLI, so `build_sandbox.js` needs to build with docker.
+    const containerCommand =
+      config.command === 'runsc' ? 'docker' : config.command;
+
     // if BUILD_SANDBOX is set, then call scripts/build_sandbox.js under gemini-cli repo
     //
     // note this can only be done with binary linked from gemini-cli repo
@@ -404,16 +417,12 @@ export async function start_sandbox(
             stdio: 'inherit',
             env: {
               ...process.env,
-              GEMINI_SANDBOX: config.command, // in case sandbox is enabled via flags (see config.ts under cli package)
+              GEMINI_SANDBOX: containerCommand, // in case sandbox is enabled via flags (see config.ts under cli package)
             },
           },
         );
       }
     }
-
-    // For runsc, use docker as the underlying container command
-    const containerCommand =
-      config.command === 'runsc' ? 'docker' : config.command;
 
     // stop if image is missing
     if (!(await ensureSandboxImageIsPresent(containerCommand, image))) {
@@ -1017,9 +1026,14 @@ async function start_lxc_sandbox(
 
     // Verify the container exists and is running
     try {
-      const lxcList = execSync(
-        `lxc list ${containerName} --format csv --columns s`,
-      )
+      const lxcList = execFileSync('lxc', [
+        'list',
+        containerName,
+        '--format',
+        'csv',
+        '--columns',
+        's',
+      ])
         .toString()
         .trim();
       if (!lxcList.includes('RUNNING')) {
@@ -1041,11 +1055,20 @@ async function start_lxc_sandbox(
     const workdir = path.resolve(process.cwd());
     const mountedDirs: string[] = [];
 
-    // Mount the current working directory into the container
+    // Mount the current working directory into the container. Paths are
+    // passed as separate execFileSync arguments (no shell) so that spaces
+    // or shell metacharacters in the workdir don't get split/misinterpreted.
     const workdirDevice = `gemini-workdir-${randomBytes(4).toString('hex')}`;
-    execSync(
-      `lxc config device add ${containerName} ${workdirDevice} disk source=${workdir} path=${workdir}`,
-    );
+    execFileSync('lxc', [
+      'config',
+      'device',
+      'add',
+      containerName,
+      workdirDevice,
+      'disk',
+      `source=${workdir}`,
+      `path=${workdir}`,
+    ]);
     mountedDirs.push(workdirDevice);
 
     // Mount additional allowed paths from config as read-only
@@ -1057,9 +1080,17 @@ async function start_lxc_sandbox(
         if (realDir !== workdir && fs.existsSync(realDir)) {
           const deviceName = `gemini-dir-${randomBytes(4).toString('hex')}`;
           try {
-            execSync(
-              `lxc config device add ${containerName} ${deviceName} disk source=${realDir} path=${realDir} readonly=true`,
-            );
+            execFileSync('lxc', [
+              'config',
+              'device',
+              'add',
+              containerName,
+              deviceName,
+              'disk',
+              `source=${realDir}`,
+              `path=${realDir}`,
+              'readonly=true',
+            ]);
             mountedDirs.push(deviceName);
           } catch {
             console.warn(
@@ -1074,7 +1105,13 @@ async function start_lxc_sandbox(
     const cleanupMounts = () => {
       for (const device of mountedDirs) {
         try {
-          execSync(`lxc config device remove ${containerName} ${device}`);
+          execFileSync('lxc', [
+            'config',
+            'device',
+            'remove',
+            containerName,
+            device,
+          ]);
         } catch {
           // ignore cleanup errors
         }
@@ -1082,8 +1119,10 @@ async function start_lxc_sandbox(
     };
     process.on('exit', cleanupMounts);
 
-    // Build lxc exec args
-    const args = ['exec', containerName, '--'];
+    // Build lxc exec args. All `lxc exec` flags (--env, --cwd) must appear
+    // BEFORE the `--` delimiter, or lxc treats them as part of the in-container
+    // command instead of as flags to `lxc exec` itself.
+    const args = ['exec', containerName];
 
     // Forward environment variables
     const envVars: Record<string, string | undefined> = {
@@ -1105,6 +1144,9 @@ async function start_lxc_sandbox(
 
     // Add working directory
     args.push('--cwd', workdir);
+
+    // All flags are set; now mark the start of the in-container command.
+    args.push('--');
 
     // Build the command to run inside the container
     const cliCmd =
@@ -1169,7 +1211,6 @@ async function start_windows_native_sandbox(
     console.error('using windows-native sandbox (TrusteeOS) ...');
 
     const workdir = path.resolve(process.cwd());
-    const appliedRestrictions: string[] = [];
 
     // Get the current user's identity for ACL application
     let currentUser: string;
@@ -1213,13 +1254,35 @@ async function start_windows_native_sandbox(
       }
     }
 
+    // For each path we're about to restrict, first snapshot its current ACLs
+    // with `icacls /save`. Restoring later replays that exact snapshot via
+    // `icacls /restore`, rather than blanket-removing all deny ACEs for the
+    // current user with `/remove:d` (which would also strip any deny rules
+    // that pre-existed for this user before this sandbox ever ran). If we
+    // can't take a snapshot, skip restricting that path rather than applying
+    // a restriction we can't safely undo.
+    const appliedRestrictions: Array<{ path: string; backupFile: string }> = [];
     for (const restrictedPath of pathsToRestrict) {
+      const backupFile = path.join(
+        os.tmpdir(),
+        `gemini-acl-backup-${randomBytes(8).toString('hex')}.txt`,
+      );
+      try {
+        execSync(`icacls "${restrictedPath}" /save "${backupFile}" /T /Q`, {
+          stdio: 'pipe',
+        });
+      } catch {
+        console.warn(
+          `Warning: Could not snapshot ACLs for ${restrictedPath}; skipping restriction.`,
+        );
+        continue;
+      }
       try {
         execSync(
           `icacls "${restrictedPath}" /deny "${currentUser}:(OI)(CI)F" /T /Q`,
           { stdio: 'pipe' },
         );
-        appliedRestrictions.push(restrictedPath);
+        appliedRestrictions.push({ path: restrictedPath, backupFile });
         console.error(`Restricted access to: ${restrictedPath}`);
       } catch {
         console.warn(
@@ -1230,20 +1293,32 @@ async function start_windows_native_sandbox(
 
     // Restore ACLs on exit to avoid leaving restrictions in place
     const restoreAcls = () => {
-      for (const restrictedPath of appliedRestrictions) {
+      for (const { path: restrictedPath, backupFile } of appliedRestrictions) {
         try {
-          execSync(
-            `icacls "${restrictedPath}" /remove:d "${currentUser}" /T /Q`,
-            { stdio: 'pipe' },
-          );
+          execSync(`icacls "${restrictedPath}" /restore "${backupFile}" /Q`, {
+            stdio: 'pipe',
+          });
         } catch {
           // ignore cleanup errors
+        } finally {
+          try {
+            fs.unlinkSync(backupFile);
+          } catch {
+            // ignore cleanup errors
+          }
         }
       }
     };
     process.on('exit', restoreAcls);
-    process.on('SIGINT', restoreAcls);
-    process.on('SIGTERM', restoreAcls);
+    // Do not restore immediately on SIGINT/SIGTERM: the interactive child
+    // process may treat the first Ctrl+C as a cancel prompt rather than an
+    // immediate exit, and would otherwise keep running with the ACL
+    // restrictions already lifted. These no-op handlers keep the parent
+    // alive so the child's own `close` handler below performs the real
+    // cleanup once it has actually terminated; `exit` above remains as a
+    // final safety net if the parent process ends some other way.
+    process.on('SIGINT', () => {});
+    process.on('SIGTERM', () => {});
 
     // Build node options
     const existingNodeOptions = process.env['NODE_OPTIONS'] || '';

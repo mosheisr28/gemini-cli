@@ -123,8 +123,15 @@ export async function parseArguments(settings: Settings): Promise<CliArgs> {
         })
         .option('sandbox', {
           alias: 's',
-          type: 'boolean',
-          description: 'Run in sandbox?',
+          // No explicit `type` here: this flag is boolean-or-string. Bare
+          // `-s`/`--sandbox` (or followed by another flag) is treated as
+          // `true`; `--sandbox docker`/`runsc`/`lxc`/`windows-native` selects
+          // a specific backend. Declaring `type: 'boolean'` would force
+          // yargs to always coerce to a boolean and leave the backend name
+          // as a stray positional argument instead of this option's value.
+          description:
+            'Run in sandbox? Pass a backend name (docker, podman, ' +
+            'sandbox-exec, runsc, lxc, windows-native) to select one explicitly.',
         })
 
         .option('yolo', {
