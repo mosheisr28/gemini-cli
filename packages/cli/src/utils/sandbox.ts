@@ -196,7 +196,12 @@ export async function start_sandbox(
     }
 
     if (config.command === 'windows-native') {
-      return await start_windows_native_sandbox(config, nodeArgs, cliConfig, cliArgs);
+      return await start_windows_native_sandbox(
+        config,
+        nodeArgs,
+        cliConfig,
+        cliArgs,
+      );
     }
 
     if (config.command === 'sandbox-exec') {
@@ -208,8 +213,12 @@ export async function start_sandbox(
       }
 
       const profile = (process.env['SEATBELT_PROFILE'] ??= 'permissive-open');
-      let profileFile = fileURLToPath(
-        new URL(`sandbox-macos-${profile}.sb`, import.meta.url),
+      // Resolved via path.join (rather than `new URL(template, import.meta.url)`)
+      // so bundlers/test transforms don't mistake this for a static asset glob.
+      const sandboxUtilsDir = path.dirname(fileURLToPath(import.meta.url));
+      let profileFile = path.join(
+        sandboxUtilsDir,
+        `sandbox-macos-${profile}.sb`,
       );
       // if profile name is not recognized, then look for file under project settings directory
       if (!BUILTIN_SEATBELT_PROFILES.includes(profile)) {
@@ -403,7 +412,8 @@ export async function start_sandbox(
     }
 
     // For runsc, use docker as the underlying container command
-    const containerCommand = config.command === 'runsc' ? 'docker' : config.command;
+    const containerCommand =
+      config.command === 'runsc' ? 'docker' : config.command;
 
     // stop if image is missing
     if (!(await ensureSandboxImageIsPresent(containerCommand, image))) {
@@ -1003,8 +1013,7 @@ async function start_lxc_sandbox(
   patcher.patch();
 
   try {
-    const containerName =
-      process.env['GEMINI_LXC_CONTAINER'] ?? 'gemini-cli';
+    const containerName = process.env['GEMINI_LXC_CONTAINER'] ?? 'gemini-cli';
 
     // Verify the container exists and is running
     try {
@@ -1027,9 +1036,7 @@ async function start_lxc_sandbox(
       );
     }
 
-    console.error(
-      `hopping into LXC sandbox (container: ${containerName}) ...`,
-    );
+    console.error(`hopping into LXC sandbox (container: ${containerName}) ...`);
 
     const workdir = path.resolve(process.cwd());
     const mountedDirs: string[] = [];
@@ -1055,7 +1062,9 @@ async function start_lxc_sandbox(
             );
             mountedDirs.push(deviceName);
           } catch {
-            console.warn(`Warning: Could not mount ${realDir} into LXC container`);
+            console.warn(
+              `Warning: Could not mount ${realDir} into LXC container`,
+            );
           }
         }
       }
@@ -1065,9 +1074,7 @@ async function start_lxc_sandbox(
     const cleanupMounts = () => {
       for (const device of mountedDirs) {
         try {
-          execSync(
-            `lxc config device remove ${containerName} ${device}`,
-          );
+          execSync(`lxc config device remove ${containerName} ${device}`);
         } catch {
           // ignore cleanup errors
         }
@@ -1100,9 +1107,8 @@ async function start_lxc_sandbox(
     args.push('--cwd', workdir);
 
     // Build the command to run inside the container
-    const cliCmd = process.env['NODE_ENV'] === 'development'
-      ? 'npm run start --'
-      : 'gemini';
+    const cliCmd =
+      process.env['NODE_ENV'] === 'development' ? 'npm run start --' : 'gemini';
 
     const quotedCliArgs = cliArgs.slice(2).map((arg) => quote([arg]));
     args.push('bash', '-c', [cliCmd, ...quotedCliArgs].join(' '));
@@ -1191,7 +1197,9 @@ async function start_windows_native_sandbox(
           appliedRestrictions.push(forbiddenPath);
           console.error(`Restricted access to: ${forbiddenPath}`);
         } catch {
-          console.warn(`Warning: Could not apply ACL restriction to ${forbiddenPath}`);
+          console.warn(
+            `Warning: Could not apply ACL restriction to ${forbiddenPath}`,
+          );
         }
       }
     }
@@ -1228,9 +1236,10 @@ async function start_windows_native_sandbox(
       ...(allNodeOptions ? { NODE_OPTIONS: allNodeOptions } : {}),
     };
 
-    const cliCmd = process.env['NODE_ENV'] === 'development'
-      ? process.argv[1]
-      : process.argv[1];
+    const cliCmd =
+      process.env['NODE_ENV'] === 'development'
+        ? process.argv[1]
+        : process.argv[1];
 
     const quotedCliArgs = cliArgs.slice(2);
 
