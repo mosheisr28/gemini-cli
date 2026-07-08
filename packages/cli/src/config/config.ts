@@ -123,6 +123,14 @@ export async function parseArguments(settings: Settings): Promise<CliArgs> {
         })
         .option('sandbox', {
           alias: 's',
+          // Must stay `type: 'boolean'`: this command also accepts a
+          // positional query (`$0 [query..]`, e.g. `gemini -s "do X"`), and
+          // an untyped/string option here would greedily consume that
+          // positional as the flag's value instead of leaving it for the
+          // query, breaking `-s <prompt>` with no other flags.
+          // To select a specific backend (docker, podman, sandbox-exec,
+          // runsc, lxc, windows-native), use the GEMINI_SANDBOX environment
+          // variable or the `tools.sandbox` setting instead of a CLI value.
           type: 'boolean',
           description: 'Run in sandbox?',
         })

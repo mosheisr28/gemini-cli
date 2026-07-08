@@ -4,7 +4,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { exec, execSync, spawn, type ChildProcess } from 'node:child_process';
+import {
+  exec,
+  execSync,
+  execFileSync,
+  spawn,
+  type ChildProcess,
+} from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -191,6 +197,19 @@ export async function start_sandbox(
   patcher.patch();
 
   try {
+    if (config.command === 'lxc') {
+      return await start_lxc_sandbox(config, nodeArgs, cliConfig, cliArgs);
+    }
+
+    if (config.command === 'windows-native') {
+      return await start_windows_native_sandbox(
+        config,
+        nodeArgs,
+        cliConfig,
+        cliArgs,
+      );
+    }
+
     if (config.command === 'sandbox-exec') {
       // disallow BUILD_SANDBOX
       if (process.env['BUILD_SANDBOX']) {
@@ -200,8 +219,12 @@ export async function start_sandbox(
       }
 
       const profile = (process.env['SEATBELT_PROFILE'] ??= 'permissive-open');
-      let profileFile = fileURLToPath(
-        new URL(`sandbox-macos-${profile}.sb`, import.meta.url),
+      // Resolved via path.join (rather than `new URL(template, import.meta.url)`)
+      // so bundlers/test transforms don't mistake this for a static asset glob.
+      const sandboxUtilsDir = path.dirname(fileURLToPath(import.meta.url));
+      let profileFile = path.join(
+        sandboxUtilsDir,
+        `sandbox-macos-${profile}.sb`,
       );
       // if profile name is not recognized, then look for file under project settings directory
       if (!BUILTIN_SEATBELT_PROFILES.includes(profile)) {
@@ -359,6 +382,13 @@ export async function start_sandbox(
     const workdir = path.resolve(process.cwd());
     const containerWorkdir = getContainerPath(workdir);
 
+    // For runsc, use docker as the underlying container command. This must be
+    // computed before the BUILD_SANDBOX block below: runsc is a container
+    // *runtime* (selected via `docker run --runtime=runsc`), not an
+    // image-building CLI, so `build_sandbox.js` needs to build with docker.
+    const containerCommand =
+      config.command === 'runsc' ? 'docker' : config.command;
+
     // if BUILD_SANDBOX is set, then call scripts/build_sandbox.js under gemini-cli repo
     //
     // note this can only be done with binary linked from gemini-cli repo
@@ -387,7 +417,7 @@ export async function start_sandbox(
             stdio: 'inherit',
             env: {
               ...process.env,
-              GEMINI_SANDBOX: config.command, // in case sandbox is enabled via flags (see config.ts under cli package)
+              GEMINI_SANDBOX: containerCommand, // in case sandbox is enabled via flags (see config.ts under cli package)
             },
           },
         );
@@ -395,7 +425,7 @@ export async function start_sandbox(
     }
 
     // stop if image is missing
-    if (!(await ensureSandboxImageIsPresent(config.command, image))) {
+    if (!(await ensureSandboxImageIsPresent(containerCommand, image))) {
       const remedy =
         image === LOCAL_DEV_SANDBOX_IMAGE_NAME
           ? 'Try running `npm run build:all` or `npm run build:sandbox` under the gemini-cli repo to build it locally, or check the image name and your network connection.'
@@ -408,6 +438,11 @@ export async function start_sandbox(
     // use interactive mode and auto-remove container on exit
     // run init binary inside container to forward signals & reap zombies
     const args = ['run', '-i', '--rm', '--init', '--workdir', containerWorkdir];
+
+    // For runsc (gVisor), add the runtime flag
+    if (config.command === 'runsc') {
+      args.push('--runtime=runsc');
+    }
 
     // add custom flags from SANDBOX_FLAGS
     if (process.env['SANDBOX_FLAGS']) {
@@ -536,7 +571,7 @@ export async function start_sandbox(
       // if using proxy, switch to internal networking through proxy
       if (proxy) {
         execSync(
-          `${config.command} network inspect ${SANDBOX_NETWORK_NAME} || ${config.command} network create --internal ${SANDBOX_NETWORK_NAME}`,
+          `${containerCommand} network inspect ${SANDBOX_NETWORK_NAME} || ${containerCommand} network create --internal ${SANDBOX_NETWORK_NAME}`,
         );
         args.push('--network', SANDBOX_NETWORK_NAME);
         // if proxy command is set, create a separate network w/ host access (i.e. non-internal)
@@ -544,7 +579,7 @@ export async function start_sandbox(
         // this allows proxy to work even on rootless podman on macos with host<->vm<->container isolation
         if (proxyCommand) {
           execSync(
-            `${config.command} network inspect ${SANDBOX_PROXY_NAME} || ${config.command} network create ${SANDBOX_PROXY_NAME}`,
+            `${containerCommand} network inspect ${SANDBOX_PROXY_NAME} || ${containerCommand} network create ${SANDBOX_PROXY_NAME}`,
           );
         }
       }
@@ -563,7 +598,7 @@ export async function start_sandbox(
     } else {
       let index = 0;
       const containerNameCheck = execSync(
-        `${config.command} ps -a --format "{{.Names}}"`,
+        `${containerCommand} ps -a --format "{{.Names}}"`,
       )
         .toString()
         .trim();
@@ -764,8 +799,12 @@ export async function start_sandbox(
     let sandboxProcess: ChildProcess | undefined = undefined;
 
     if (proxyCommand) {
-      // run proxyCommand in its own container
-      const proxyContainerCommand = `${config.command} run --rm --init ${userFlag} --name ${SANDBOX_PROXY_NAME} --network ${SANDBOX_PROXY_NAME} -p 8877:8877 -v ${process.cwd()}:${workdir} --workdir ${workdir} ${image} ${proxyCommand}`;
+      // run proxyCommand in its own container. Include the same
+      // --runtime=runsc flag as the main sandbox container so the proxy
+      // isn't left running under Docker's default runtime when the user
+      // requested gVisor isolation.
+      const runtimeFlag = config.command === 'runsc' ? '--runtime=runsc ' : '';
+      const proxyContainerCommand = `${containerCommand} run --rm --init ${runtimeFlag}${userFlag} --name ${SANDBOX_PROXY_NAME} --network ${SANDBOX_PROXY_NAME} -p 8877:8877 -v ${process.cwd()}:${workdir} --workdir ${workdir} ${image} ${proxyCommand}`;
       proxyProcess = spawn(proxyContainerCommand, {
         stdio: ['ignore', 'pipe', 'pipe'],
         shell: true,
@@ -774,7 +813,7 @@ export async function start_sandbox(
       // install handlers to stop proxy on exit/signal
       const stopProxy = () => {
         console.log('stopping proxy container ...');
-        execSync(`${config.command} rm -f ${SANDBOX_PROXY_NAME}`);
+        execSync(`${containerCommand} rm -f ${SANDBOX_PROXY_NAME}`);
       };
       process.on('exit', stopProxy);
       process.on('SIGINT', stopProxy);
@@ -802,13 +841,13 @@ export async function start_sandbox(
       // connect proxy container to sandbox network
       // (workaround for older versions of docker that don't support multiple --network args)
       await execAsync(
-        `${config.command} network connect ${SANDBOX_NETWORK_NAME} ${SANDBOX_PROXY_NAME}`,
+        `${containerCommand} network connect ${SANDBOX_NETWORK_NAME} ${SANDBOX_PROXY_NAME}`,
       );
     }
 
     // spawn child and let it inherit stdio
     process.stdin.pause();
-    sandboxProcess = spawn(config.command, args, {
+    sandboxProcess = spawn(containerCommand, args, {
       stdio: 'inherit',
     });
 
@@ -964,4 +1003,544 @@ async function ensureSandboxImageIsPresent(
     `Failed to obtain sandbox image ${image} after check and pull attempt.`,
   );
   return false; // Pull command failed or image still not present
+}
+
+/**
+ * Starts a sandbox using LXC (Linux Containers).
+ *
+ * Unlike container-based sandboxes (docker/podman), LXC sandboxes execute
+ * commands inside a pre-existing, user-managed container using `lxc exec`.
+ * The container must already exist and be running.
+ *
+ * Set GEMINI_LXC_CONTAINER to specify the container name (defaults to 'gemini-cli').
+ */
+async function start_lxc_sandbox(
+  config: SandboxConfig,
+  nodeArgs: string[] = [],
+  cliConfig?: Config,
+  cliArgs: string[] = [],
+): Promise<number> {
+  const patcher = new ConsolePatcher({
+    debugMode: cliConfig?.getDebugMode() || !!process.env['DEBUG'],
+    stderr: true,
+  });
+  patcher.patch();
+
+  try {
+    const containerName = process.env['GEMINI_LXC_CONTAINER'] ?? 'gemini-cli';
+
+    // Verify the container exists and is running
+    try {
+      const lxcList = execFileSync('lxc', [
+        'list',
+        containerName,
+        '--format',
+        'csv',
+        '--columns',
+        's',
+      ])
+        .toString()
+        .trim();
+      if (!lxcList.includes('RUNNING')) {
+        throw new FatalSandboxError(
+          `LXC container '${containerName}' is not running. ` +
+            `Start it with: lxc start ${containerName}`,
+        );
+      }
+    } catch (err) {
+      if (err instanceof FatalSandboxError) throw err;
+      throw new FatalSandboxError(
+        `LXC container '${containerName}' not found. ` +
+          `Create it with: lxc launch ubuntu:22.04 ${containerName}`,
+      );
+    }
+
+    console.error(`hopping into LXC sandbox (container: ${containerName}) ...`);
+
+    const workdir = path.resolve(process.cwd());
+    const mountedDirs: string[] = [];
+
+    // Mount the current working directory into the container. Paths are
+    // passed as separate execFileSync arguments (no shell) so that spaces
+    // or shell metacharacters in the workdir don't get split/misinterpreted.
+    const workdirDevice = `gemini-workdir-${randomBytes(4).toString('hex')}`;
+    execFileSync('lxc', [
+      'config',
+      'device',
+      'add',
+      containerName,
+      workdirDevice,
+      'disk',
+      `source=${workdir}`,
+      `path=${workdir}`,
+    ]);
+    mountedDirs.push(workdirDevice);
+
+    // Mount additional workspace directories from --include-directories.
+    // Mounted read-write (not readonly): WorkspaceContext.isPathWithinWorkspace()
+    // treats these as full workspace roots for the edit tool's write
+    // validation, and the macOS Seatbelt profile explicitly allows writes to
+    // them too (see sandbox-macos-permissive-open.sb's INCLUDE_DIR_* rules) —
+    // mounting them read-only here would let an edit pass Gemini's own
+    // validation and then fail at the OS level inside the container.
+    if (cliConfig) {
+      const workspaceContext = cliConfig.getWorkspaceContext();
+      const directories = workspaceContext.getDirectories();
+      for (const dir of directories) {
+        const realDir = fs.realpathSync(dir);
+        if (realDir !== workdir && fs.existsSync(realDir)) {
+          const deviceName = `gemini-dir-${randomBytes(4).toString('hex')}`;
+          try {
+            execFileSync('lxc', [
+              'config',
+              'device',
+              'add',
+              containerName,
+              deviceName,
+              'disk',
+              `source=${realDir}`,
+              `path=${realDir}`,
+            ]);
+            mountedDirs.push(deviceName);
+          } catch {
+            console.warn(
+              `Warning: Could not mount ${realDir} into LXC container`,
+            );
+          }
+        }
+      }
+    }
+
+    // Mount credential material so Login with Google / Application Default
+    // Credentials work inside the container, matching what the Docker path
+    // mounts. LXC devices mount at the exact `path=` given (no path
+    // translation like Docker's container filesystem), so mounting at the
+    // same absolute host path lets the in-container gemini process find
+    // these the same way it would on the host.
+    if (fs.existsSync(USER_SETTINGS_DIR)) {
+      const settingsDeviceName = `gemini-settings-${randomBytes(4).toString('hex')}`;
+      try {
+        execFileSync('lxc', [
+          'config',
+          'device',
+          'add',
+          containerName,
+          settingsDeviceName,
+          'disk',
+          `source=${USER_SETTINGS_DIR}`,
+          `path=${USER_SETTINGS_DIR}`,
+        ]);
+        mountedDirs.push(settingsDeviceName);
+      } catch {
+        console.warn(
+          `Warning: Could not mount ${USER_SETTINGS_DIR} into LXC container`,
+        );
+      }
+    }
+
+    const gcloudConfigDir = path.join(os.homedir(), '.config', 'gcloud');
+    if (fs.existsSync(gcloudConfigDir)) {
+      const gcloudDeviceName = `gemini-gcloud-${randomBytes(4).toString('hex')}`;
+      try {
+        execFileSync('lxc', [
+          'config',
+          'device',
+          'add',
+          containerName,
+          gcloudDeviceName,
+          'disk',
+          `source=${gcloudConfigDir}`,
+          `path=${gcloudConfigDir}`,
+          'readonly=true',
+        ]);
+        mountedDirs.push(gcloudDeviceName);
+      } catch {
+        console.warn(
+          `Warning: Could not mount ${gcloudConfigDir} into LXC container`,
+        );
+      }
+    }
+
+    let adcFile: string | undefined;
+    if (process.env['GOOGLE_APPLICATION_CREDENTIALS']) {
+      adcFile = process.env['GOOGLE_APPLICATION_CREDENTIALS'];
+      if (fs.existsSync(adcFile)) {
+        const adcDeviceName = `gemini-adc-${randomBytes(4).toString('hex')}`;
+        try {
+          execFileSync('lxc', [
+            'config',
+            'device',
+            'add',
+            containerName,
+            adcDeviceName,
+            'disk',
+            `source=${adcFile}`,
+            `path=${adcFile}`,
+            'readonly=true',
+          ]);
+          mountedDirs.push(adcDeviceName);
+        } catch {
+          console.warn(
+            `Warning: Could not mount ${adcFile} into LXC container`,
+          );
+        }
+      } else {
+        adcFile = undefined;
+      }
+    }
+
+    // Clean up mounts on exit
+    const cleanupMounts = () => {
+      for (const device of mountedDirs) {
+        try {
+          execFileSync('lxc', [
+            'config',
+            'device',
+            'remove',
+            containerName,
+            device,
+          ]);
+        } catch {
+          // ignore cleanup errors
+        }
+      }
+    };
+    process.on('exit', cleanupMounts);
+
+    // Build lxc exec args. All `lxc exec` flags (--env, --cwd) must appear
+    // BEFORE the `--` delimiter, or lxc treats them as part of the in-container
+    // command instead of as flags to `lxc exec` itself.
+    const args = ['exec', containerName];
+
+    // Forward environment variables. GOOGLE_APPLICATION_CREDENTIALS is
+    // forwarded unchanged (not translated, unlike the Docker path) since the
+    // ADC file above was mounted at the same absolute path it has on the host.
+    //
+    // HOME is forwarded explicitly: `lxc exec` defaults to running as root
+    // (HOME=/root) unless told otherwise, and Storage.getGlobalGeminiDir()
+    // resolves the credential directory from os.homedir(). Without this, the
+    // in-container process would look for its credential store at
+    // /root/.gemini instead of the path we mounted USER_SETTINGS_DIR at above.
+    const existingNodeOptions = process.env['NODE_OPTIONS'] || '';
+    const allNodeOptions = [
+      ...(existingNodeOptions ? [existingNodeOptions] : []),
+      ...nodeArgs,
+    ].join(' ');
+    const envVars: Record<string, string | undefined> = {
+      GEMINI_API_KEY: process.env['GEMINI_API_KEY'],
+      GOOGLE_API_KEY: process.env['GOOGLE_API_KEY'],
+      GOOGLE_GENAI_USE_VERTEXAI: process.env['GOOGLE_GENAI_USE_VERTEXAI'],
+      GOOGLE_GENAI_USE_GCA: process.env['GOOGLE_GENAI_USE_GCA'],
+      GOOGLE_CLOUD_PROJECT: process.env['GOOGLE_CLOUD_PROJECT'],
+      GOOGLE_CLOUD_LOCATION: process.env['GOOGLE_CLOUD_LOCATION'],
+      GEMINI_MODEL: process.env['GEMINI_MODEL'],
+      GOOGLE_APPLICATION_CREDENTIALS: adcFile,
+      HOME: os.homedir(),
+      NODE_OPTIONS: allNodeOptions || undefined,
+      SANDBOX: 'lxc',
+    };
+
+    for (const [key, value] of Object.entries(envVars)) {
+      if (value) {
+        args.push('--env', `${key}=${value}`);
+      }
+    }
+
+    // Add working directory
+    args.push('--cwd', workdir);
+
+    // All flags are set; now mark the start of the in-container command.
+    args.push('--');
+
+    // Build the command to run inside the container
+    const cliCmd =
+      process.env['NODE_ENV'] === 'development' ? 'npm run start --' : 'gemini';
+
+    const quotedCliArgs = cliArgs.slice(2).map((arg) => quote([arg]));
+    args.push('bash', '-c', [cliCmd, ...quotedCliArgs].join(' '));
+
+    process.stdin.pause();
+    const sandboxProcess = spawn('lxc', args, {
+      stdio: 'inherit',
+    });
+
+    return new Promise<number>((resolve, reject) => {
+      sandboxProcess.on('error', reject);
+      sandboxProcess.on('close', (code) => {
+        process.stdin.resume();
+        cleanupMounts();
+        resolve(code ?? 1);
+      });
+    });
+  } finally {
+    patcher.cleanup();
+  }
+}
+
+/**
+ * Starts a sandbox using Windows native sandboxing (TrusteeOS).
+ *
+ * Windows native sandboxing uses Windows ACLs (Access Control Lists) and
+ * the Windows trustee model to restrict file system access. The sandbox
+ * applies DENY ACEs (Access Control Entries) for the current user to
+ * forbidden paths, restricting the gemini process's access.
+ *
+ * This approach leverages the Windows security model where:
+ * - "Trustees" are security principals (users, groups, etc.)
+ * - ACEs grant or deny access rights to trustees
+ * - icacls.exe is used to apply these restrictions
+ *
+ * Set GEMINI_SANDBOX_ALLOWED_PATHS and GEMINI_SANDBOX_FORBIDDEN_PATHS to
+ * control which paths are accessible.
+ */
+async function start_windows_native_sandbox(
+  config: SandboxConfig,
+  nodeArgs: string[] = [],
+  cliConfig?: Config,
+  cliArgs: string[] = [],
+): Promise<number> {
+  if (os.platform() !== 'win32') {
+    throw new FatalSandboxError(
+      'windows-native sandboxing is only supported on Windows',
+    );
+  }
+
+  const patcher = new ConsolePatcher({
+    debugMode: cliConfig?.getDebugMode() || !!process.env['DEBUG'],
+    stderr: true,
+  });
+  patcher.patch();
+
+  try {
+    console.error('using windows-native sandbox (TrusteeOS) ...');
+
+    const workdir = path.resolve(process.cwd());
+
+    // Get the current user's identity for ACL application
+    let currentUser: string;
+    try {
+      currentUser = execSync('whoami').toString().trim();
+    } catch {
+      throw new FatalSandboxError(
+        'Failed to determine current user for Windows sandbox ACL setup',
+      );
+    }
+
+    // Apply DENY ACEs to forbidden paths using icacls
+    const forbiddenPaths = (process.env['GEMINI_SANDBOX_FORBIDDEN_PATHS'] ?? '')
+      .split(';')
+      .map((p) => p.trim())
+      .filter(Boolean);
+
+    // Resolve symlinks before restricting: without /L, icacls follows a
+    // symlink/junction to operate on its real target, so restricting the
+    // literal (symlinked) path already restricts the underlying data — any
+    // other symlink pointing at that same real path inherits the same
+    // restriction, since the ACL lives on the real object, not the link.
+    //
+    // We therefore restrict ONLY the resolved real path per forbidden entry
+    // (deduped via the Set), rather than also separately restricting the
+    // literal symlink path. Restricting both would process the same
+    // underlying object twice: the first pass's DENY would already be
+    // reflected in the ACL that the second pass's /save snapshots, so the
+    // second pass's later /restore would replay that already-denied
+    // snapshot last and leave the DENY ACE stuck after "cleanup".
+    const resolvedPaths = new Set<string>();
+    for (const forbiddenPath of forbiddenPaths) {
+      if (!fs.existsSync(forbiddenPath)) {
+        continue;
+      }
+      try {
+        const realPath = fs.realpathSync(forbiddenPath);
+        if (realPath !== forbiddenPath) {
+          console.error(
+            `Note: '${forbiddenPath}' resolves to '${realPath}'; restricting the resolved path.`,
+          );
+        }
+        resolvedPaths.add(realPath);
+      } catch {
+        console.warn(
+          `Warning: Could not resolve real path for ${forbiddenPath}; restricting the literal path instead.`,
+        );
+        resolvedPaths.add(forbiddenPath);
+      }
+    }
+
+    // Drop any path that is a descendant of another path already in the set:
+    // /T on the ancestor already recurses into it, so restricting both would
+    // process the same underlying files twice — the same class of
+    // save/deny/restore corruption fixed for symlinks above, just triggered
+    // by overlapping GEMINI_SANDBOX_FORBIDDEN_PATHS entries (e.g.
+    // "C:\secret;C:\secret\child") instead of a symlink.
+    const isPathUnderOrEqual = (child: string, parent: string): boolean => {
+      const c = child.toLowerCase();
+      const p = parent.toLowerCase();
+      return c === p || c.startsWith(`${p}\\`) || c.startsWith(`${p}/`);
+    };
+    const allResolvedPaths = [...resolvedPaths];
+    const pathsToRestrict = allResolvedPaths.filter(
+      (p) =>
+        !allResolvedPaths.some(
+          (other) => other !== p && isPathUnderOrEqual(p, other),
+        ),
+    );
+
+    // Back up ACLs to a directory verified to sit outside every path we're
+    // about to restrict. Using os.tmpdir() here would be unsafe: if a
+    // forbidden path is (or is an ancestor of) the temp directory, the
+    // backup file would land inside the very tree the DENY ACE below
+    // recurses over, locking this same user out of the backup needed to
+    // undo it.
+    const backupDir = path.join(USER_SETTINGS_DIR, 'sandbox-acl-backups');
+    const backupDirIsRestricted = pathsToRestrict.some((p) =>
+      isPathUnderOrEqual(backupDir, p),
+    );
+    if (backupDirIsRestricted) {
+      throw new FatalSandboxError(
+        `Cannot start windows-native sandbox: '${USER_SETTINGS_DIR}' (or an ` +
+          'ancestor of it) is listed in GEMINI_SANDBOX_FORBIDDEN_PATHS, which ' +
+          'would prevent safely backing up and restoring ACLs. Remove it from ' +
+          'the forbidden paths list.',
+      );
+    }
+    try {
+      fs.mkdirSync(backupDir, { recursive: true });
+    } catch {
+      throw new FatalSandboxError(
+        `Failed to create ACL backup directory at ${backupDir}`,
+      );
+    }
+
+    // Snapshot ALL paths first, before denying ANY of them. Interleaving
+    // save+deny per path (as before) meant that for overlapping paths, a
+    // later path's snapshot could already reflect an earlier path's DENY —
+    // and since restores replay in the same order, the corrupted
+    // (already-denied) snapshot would be restored last, leaving the DENY ACE
+    // stuck after "cleanup". Two-phase processing ensures every snapshot
+    // reflects the true pre-sandbox state regardless of processing order.
+    const snapshots: Array<{ path: string; backupFile: string }> = [];
+    for (const restrictedPath of pathsToRestrict) {
+      const backupFile = path.join(
+        backupDir,
+        `${randomBytes(8).toString('hex')}.acl`,
+      );
+      try {
+        execSync(`icacls "${restrictedPath}" /save "${backupFile}" /T /Q`, {
+          stdio: 'pipe',
+        });
+        snapshots.push({ path: restrictedPath, backupFile });
+      } catch {
+        console.warn(
+          `Warning: Could not snapshot ACLs for ${restrictedPath}; skipping restriction.`,
+        );
+      }
+    }
+
+    // Now apply DENY for every successfully-snapshotted path. The backup is
+    // recorded for restore BEFORE calling /deny (not after), so that even if
+    // /deny throws partway through a recursive operation — some DENY ACEs
+    // may already have been applied to a subset of files before the
+    // error — we still attempt to restore from the snapshot taken above
+    // rather than silently discarding it.
+    const appliedRestrictions: Array<{ path: string; backupFile: string }> = [];
+    for (const { path: restrictedPath, backupFile } of snapshots) {
+      appliedRestrictions.push({ path: restrictedPath, backupFile });
+      try {
+        execSync(
+          `icacls "${restrictedPath}" /deny "${currentUser}:(OI)(CI)F" /T /Q`,
+          { stdio: 'pipe' },
+        );
+        console.error(`Restricted access to: ${restrictedPath}`);
+      } catch {
+        console.warn(
+          `Warning: Could not fully apply ACL restriction to ${restrictedPath}. ` +
+            'Will still attempt to restore any partially-applied changes on exit.',
+        );
+      }
+    }
+
+    // Restore ACLs on exit to avoid leaving restrictions in place
+    const restoreAcls = () => {
+      for (const { path: restrictedPath, backupFile } of appliedRestrictions) {
+        try {
+          execSync(`icacls "${restrictedPath}" /restore "${backupFile}" /Q`, {
+            stdio: 'pipe',
+          });
+        } catch (err) {
+          // Surface this instead of failing silently: if /restore doesn't
+          // succeed, the DENY ACE applied above may still be in effect on
+          // ${restrictedPath} after this process exits (e.g. this has only
+          // been validated against directory paths — /restore behavior for
+          // an individual forbidden *file* has not been confirmed on real
+          // Windows). Leave the backup file in place in that case so the
+          // restriction can still be undone manually with
+          // `icacls "${restrictedPath}" /restore "${backupFile}" /Q`.
+          console.warn(
+            `Warning: Failed to restore ACLs for ${restrictedPath}. ` +
+              `It may still have a DENY restriction applied. To restore ` +
+              `manually, run: icacls "${restrictedPath}" /restore "${backupFile}" /Q`,
+          );
+          if (err instanceof Error) {
+            console.warn(err.message);
+          }
+          continue;
+        }
+        try {
+          fs.unlinkSync(backupFile);
+        } catch {
+          // ignore cleanup errors for the now-unneeded backup file
+        }
+      }
+    };
+    process.on('exit', restoreAcls);
+    // Do not restore immediately on SIGINT/SIGTERM: the interactive child
+    // process may treat the first Ctrl+C as a cancel prompt rather than an
+    // immediate exit, and would otherwise keep running with the ACL
+    // restrictions already lifted. These no-op handlers keep the parent
+    // alive so the child's own `close` handler below performs the real
+    // cleanup once it has actually terminated; `exit` above remains as a
+    // final safety net if the parent process ends some other way.
+    process.on('SIGINT', () => {});
+    process.on('SIGTERM', () => {});
+
+    // Build node options
+    const existingNodeOptions = process.env['NODE_OPTIONS'] || '';
+    const allNodeOptions = [
+      ...(existingNodeOptions ? [existingNodeOptions] : []),
+      ...nodeArgs,
+    ].join(' ');
+
+    // Run the gemini process with the current environment
+    // The ACL restrictions applied above will limit file access
+    const sandboxEnv = {
+      ...process.env,
+      SANDBOX: 'windows-native',
+      ...(allNodeOptions ? { NODE_OPTIONS: allNodeOptions } : {}),
+    };
+
+    const cliCmd =
+      process.env['NODE_ENV'] === 'development'
+        ? process.argv[1]
+        : process.argv[1];
+
+    const quotedCliArgs = cliArgs.slice(2);
+
+    process.stdin.pause();
+    const sandboxProcess = spawn(process.argv[0], [cliCmd, ...quotedCliArgs], {
+      cwd: workdir,
+      env: sandboxEnv,
+      stdio: 'inherit',
+    });
+
+    return new Promise<number>((resolve, reject) => {
+      sandboxProcess.on('error', reject);
+      sandboxProcess.on('close', (code) => {
+        process.stdin.resume();
+        restoreAcls();
+        resolve(code ?? 1);
+      });
+    });
+  } finally {
+    patcher.cleanup();
+  }
 }
