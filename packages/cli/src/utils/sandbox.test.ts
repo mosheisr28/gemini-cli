@@ -239,7 +239,7 @@ describe('start_sandbox', () => {
       );
     });
 
-    it('mounts additional workspace directories as read-only', async () => {
+    it('mounts additional workspace directories read-write (matching WorkspaceContext write validation)', async () => {
       mockRunningContainer();
       mockExistsSync.mockReturnValue(true);
 
@@ -262,14 +262,21 @@ describe('start_sandbox', () => {
       fakeChild.emit('close', 0);
       await resultPromise;
 
-      expect(mockExecFileSync).toHaveBeenCalledWith(
-        'lxc',
-        expect.arrayContaining([
-          'source=/extra/dir',
-          'path=/extra/dir',
-          'readonly=true',
-        ]),
+      // Must NOT be readonly: the edit tool's write validation
+      // (WorkspaceContext.isPathWithinWorkspace) and the macOS Seatbelt
+      // profile both treat included directories as fully writable.
+      const deviceAddCalls = mockExecFileSync.mock.calls.filter(
+        ([cmd, args]) =>
+          cmd === 'lxc' && Array.isArray(args) && args[2] === 'add',
       );
+      const extraDirCall = deviceAddCalls.find(([, args]) =>
+        (args as string[]).includes('source=/extra/dir'),
+      );
+      expect(extraDirCall).toBeDefined();
+      expect(extraDirCall![1]).toEqual(
+        expect.arrayContaining(['source=/extra/dir', 'path=/extra/dir']),
+      );
+      expect(extraDirCall![1]).not.toContain('readonly=true');
     });
 
     it('preserves paths containing spaces as single arguments (no shell splitting)', async () => {
@@ -358,6 +365,50 @@ describe('start_sandbox', () => {
       expect(
         spawnArgs.some((a) => a.startsWith('GOOGLE_APPLICATION_CREDENTIALS=')),
       ).toBe(false);
+      vi.unstubAllEnvs();
+    });
+
+    it('forwards HOME so the mounted credential store is found by os.homedir() inside the container', async () => {
+      mockRunningContainer();
+
+      const fakeChild = createFakeChildProcess();
+      mockSpawn.mockReturnValue(fakeChild);
+
+      const resultPromise = start_sandbox(lxcConfig, [], undefined, CLI_ARGS);
+      fakeChild.emit('close', 0);
+      await resultPromise;
+
+      // lxc exec defaults to root (HOME=/root) unless told otherwise; without
+      // this, the mounted ~/.gemini credential store would be invisible to
+      // the in-container process.
+      const spawnArgs = mockSpawn.mock.calls.find(
+        ([cmd]) => cmd === 'lxc',
+      )?.[1] as string[];
+      expect(spawnArgs).toContain(`HOME=${os.homedir()}`);
+    });
+
+    it('forwards NODE_OPTIONS built from nodeArgs (e.g. autoConfigureMemory)', async () => {
+      mockRunningContainer();
+      // Isolate from whatever NODE_OPTIONS this test runner itself was
+      // started with, so the assertion below is deterministic.
+      vi.stubEnv('NODE_OPTIONS', '');
+
+      const fakeChild = createFakeChildProcess();
+      mockSpawn.mockReturnValue(fakeChild);
+
+      const resultPromise = start_sandbox(
+        lxcConfig,
+        ['--max-old-space-size=4096'],
+        undefined,
+        CLI_ARGS,
+      );
+      fakeChild.emit('close', 0);
+      await resultPromise;
+
+      const spawnArgs = mockSpawn.mock.calls.find(
+        ([cmd]) => cmd === 'lxc',
+      )?.[1] as string[];
+      expect(spawnArgs).toContain('NODE_OPTIONS=--max-old-space-size=4096');
       vi.unstubAllEnvs();
     });
   });
@@ -590,6 +641,143 @@ describe('start_sandbox', () => {
       await expect(start_sandbox(winConfig)).rejects.toThrow(
         /Failed to determine current user/,
       );
+    });
+
+    it('stores ACL backups under USER_SETTINGS_DIR, not os.tmpdir()', async () => {
+      mockPlatform.mockReturnValue('win32');
+      mockExistsSync.mockReturnValue(true);
+      vi.stubEnv('GEMINI_SANDBOX_FORBIDDEN_PATHS', 'C:\\secret');
+      mockExecSync.mockImplementation((cmd) => {
+        if (cmd === 'whoami') {
+          return Buffer.from('DOMAIN\\user');
+        }
+        return Buffer.from('');
+      });
+
+      const fakeChild = createFakeChildProcess();
+      mockSpawn.mockReturnValue(fakeChild);
+
+      const resultPromise = start_sandbox(winConfig, [], undefined, CLI_ARGS);
+      fakeChild.emit('close', 0);
+      await resultPromise;
+
+      const saveCall = mockExecSync.mock.calls
+        .map(([cmd]) => cmd as string)
+        .find((c) => c.includes('/save'));
+      expect(saveCall).toContain(USER_SETTINGS_DIR);
+      expect(saveCall).not.toContain('/tmp');
+      vi.unstubAllEnvs();
+    });
+
+    it('throws instead of restricting when the ACL backup directory itself would be restricted', async () => {
+      mockPlatform.mockReturnValue('win32');
+      mockExistsSync.mockReturnValue(true);
+      // The backup directory lives under USER_SETTINGS_DIR; forbidding
+      // USER_SETTINGS_DIR itself would trap the backups we need to restore.
+      vi.stubEnv('GEMINI_SANDBOX_FORBIDDEN_PATHS', USER_SETTINGS_DIR);
+      mockExecSync.mockImplementation((cmd) => {
+        if (cmd === 'whoami') {
+          return Buffer.from('DOMAIN\\user');
+        }
+        return Buffer.from('');
+      });
+
+      await expect(start_sandbox(winConfig)).rejects.toThrow(
+        /would prevent safely backing up and restoring ACLs/,
+      );
+      vi.unstubAllEnvs();
+    });
+
+    it('dedupes overlapping forbidden paths, restricting only the ancestor', async () => {
+      mockPlatform.mockReturnValue('win32');
+      mockExistsSync.mockReturnValue(true);
+      vi.stubEnv(
+        'GEMINI_SANDBOX_FORBIDDEN_PATHS',
+        'C:\\secret;C:\\secret\\child',
+      );
+      mockExecSync.mockImplementation((cmd) => {
+        if (cmd === 'whoami') {
+          return Buffer.from('DOMAIN\\user');
+        }
+        return Buffer.from('');
+      });
+
+      const fakeChild = createFakeChildProcess();
+      mockSpawn.mockReturnValue(fakeChild);
+
+      const resultPromise = start_sandbox(winConfig, [], undefined, CLI_ARGS);
+      fakeChild.emit('close', 0);
+      await resultPromise;
+
+      const calls = mockExecSync.mock.calls.map(([cmd]) => cmd as string);
+      // Only the ancestor is restricted — /T on it already recurses into
+      // the child, so restricting both would process the same files twice.
+      expect(calls.some((c) => c.startsWith('icacls "C:\\secret" /deny'))).toBe(
+        true,
+      );
+      expect(
+        calls.some((c) => c.startsWith('icacls "C:\\secret\\child" /deny')),
+      ).toBe(false);
+    });
+
+    it('snapshots every path before denying any of them (two-phase)', async () => {
+      mockPlatform.mockReturnValue('win32');
+      mockExistsSync.mockReturnValue(true);
+      vi.stubEnv('GEMINI_SANDBOX_FORBIDDEN_PATHS', 'C:\\secret-a;C:\\secret-b');
+      mockExecSync.mockImplementation((cmd) => {
+        if (cmd === 'whoami') {
+          return Buffer.from('DOMAIN\\user');
+        }
+        return Buffer.from('');
+      });
+
+      const fakeChild = createFakeChildProcess();
+      mockSpawn.mockReturnValue(fakeChild);
+
+      const resultPromise = start_sandbox(winConfig, [], undefined, CLI_ARGS);
+      fakeChild.emit('close', 0);
+      await resultPromise;
+
+      const calls = mockExecSync.mock.calls.map(([cmd]) => cmd as string);
+      const lastSaveIndex = calls.reduce(
+        (last, c, i) => (c.includes('/save') ? i : last),
+        -1,
+      );
+      const firstDenyIndex = calls.findIndex((c) => c.includes('/deny'));
+      expect(lastSaveIndex).toBeGreaterThan(-1);
+      expect(firstDenyIndex).toBeGreaterThan(-1);
+      expect(lastSaveIndex).toBeLessThan(firstDenyIndex);
+    });
+
+    it('still attempts to restore a path whose /deny call fails partway through', async () => {
+      mockPlatform.mockReturnValue('win32');
+      mockExistsSync.mockReturnValue(true);
+      vi.stubEnv('GEMINI_SANDBOX_FORBIDDEN_PATHS', 'C:\\secret');
+      mockExecSync.mockImplementation((cmd) => {
+        const cmdStr = cmd as string;
+        if (cmdStr === 'whoami') {
+          return Buffer.from('DOMAIN\\user');
+        }
+        if (cmdStr.includes('/deny')) {
+          throw new Error('access denied partway through recursive deny');
+        }
+        return Buffer.from('');
+      });
+
+      const fakeChild = createFakeChildProcess();
+      mockSpawn.mockReturnValue(fakeChild);
+
+      const resultPromise = start_sandbox(winConfig, [], undefined, CLI_ARGS);
+      fakeChild.emit('close', 0);
+      await resultPromise;
+
+      // Even though /deny threw, the snapshot taken beforehand must still
+      // be used to attempt a restore — a partial deny could have applied
+      // some DENY ACEs before failing.
+      const calls = mockExecSync.mock.calls.map(([cmd]) => cmd as string);
+      expect(
+        calls.some((c) => c.startsWith('icacls "C:\\secret" /restore')),
+      ).toBe(true);
     });
 
     describe('symlink defense', () => {

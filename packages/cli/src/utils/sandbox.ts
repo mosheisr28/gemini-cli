@@ -198,7 +198,7 @@ export async function start_sandbox(
 
   try {
     if (config.command === 'lxc') {
-      return await start_lxc_sandbox(config, cliConfig, cliArgs);
+      return await start_lxc_sandbox(config, nodeArgs, cliConfig, cliArgs);
     }
 
     if (config.command === 'windows-native') {
@@ -1016,6 +1016,7 @@ async function ensureSandboxImageIsPresent(
  */
 async function start_lxc_sandbox(
   config: SandboxConfig,
+  nodeArgs: string[] = [],
   cliConfig?: Config,
   cliArgs: string[] = [],
 ): Promise<number> {
@@ -1075,7 +1076,13 @@ async function start_lxc_sandbox(
     ]);
     mountedDirs.push(workdirDevice);
 
-    // Mount additional allowed paths from config as read-only
+    // Mount additional workspace directories from --include-directories.
+    // Mounted read-write (not readonly): WorkspaceContext.isPathWithinWorkspace()
+    // treats these as full workspace roots for the edit tool's write
+    // validation, and the macOS Seatbelt profile explicitly allows writes to
+    // them too (see sandbox-macos-permissive-open.sb's INCLUDE_DIR_* rules) —
+    // mounting them read-only here would let an edit pass Gemini's own
+    // validation and then fail at the OS level inside the container.
     if (cliConfig) {
       const workspaceContext = cliConfig.getWorkspaceContext();
       const directories = workspaceContext.getDirectories();
@@ -1093,7 +1100,6 @@ async function start_lxc_sandbox(
               'disk',
               `source=${realDir}`,
               `path=${realDir}`,
-              'readonly=true',
             ]);
             mountedDirs.push(deviceName);
           } catch {
@@ -1209,6 +1215,17 @@ async function start_lxc_sandbox(
     // Forward environment variables. GOOGLE_APPLICATION_CREDENTIALS is
     // forwarded unchanged (not translated, unlike the Docker path) since the
     // ADC file above was mounted at the same absolute path it has on the host.
+    //
+    // HOME is forwarded explicitly: `lxc exec` defaults to running as root
+    // (HOME=/root) unless told otherwise, and Storage.getGlobalGeminiDir()
+    // resolves the credential directory from os.homedir(). Without this, the
+    // in-container process would look for its credential store at
+    // /root/.gemini instead of the path we mounted USER_SETTINGS_DIR at above.
+    const existingNodeOptions = process.env['NODE_OPTIONS'] || '';
+    const allNodeOptions = [
+      ...(existingNodeOptions ? [existingNodeOptions] : []),
+      ...nodeArgs,
+    ].join(' ');
     const envVars: Record<string, string | undefined> = {
       GEMINI_API_KEY: process.env['GEMINI_API_KEY'],
       GOOGLE_API_KEY: process.env['GOOGLE_API_KEY'],
@@ -1218,6 +1235,8 @@ async function start_lxc_sandbox(
       GOOGLE_CLOUD_LOCATION: process.env['GOOGLE_CLOUD_LOCATION'],
       GEMINI_MODEL: process.env['GEMINI_MODEL'],
       GOOGLE_APPLICATION_CREDENTIALS: adcFile,
+      HOME: os.homedir(),
+      NODE_OPTIONS: allNodeOptions || undefined,
       SANDBOX: 'lxc',
     };
 
@@ -1326,7 +1345,7 @@ async function start_windows_native_sandbox(
     // reflected in the ACL that the second pass's /save snapshots, so the
     // second pass's later /restore would replay that already-denied
     // snapshot last and leave the DENY ACE stuck after "cleanup".
-    const pathsToRestrict = new Set<string>();
+    const resolvedPaths = new Set<string>();
     for (const forbiddenPath of forbiddenPaths) {
       if (!fs.existsSync(forbiddenPath)) {
         continue;
@@ -1338,48 +1357,104 @@ async function start_windows_native_sandbox(
             `Note: '${forbiddenPath}' resolves to '${realPath}'; restricting the resolved path.`,
           );
         }
-        pathsToRestrict.add(realPath);
+        resolvedPaths.add(realPath);
       } catch {
         console.warn(
           `Warning: Could not resolve real path for ${forbiddenPath}; restricting the literal path instead.`,
         );
-        pathsToRestrict.add(forbiddenPath);
+        resolvedPaths.add(forbiddenPath);
       }
     }
 
-    // For each path we're about to restrict, first snapshot its current ACLs
-    // with `icacls /save`. Restoring later replays that exact snapshot via
-    // `icacls /restore`, rather than blanket-removing all deny ACEs for the
-    // current user with `/remove:d` (which would also strip any deny rules
-    // that pre-existed for this user before this sandbox ever ran). If we
-    // can't take a snapshot, skip restricting that path rather than applying
-    // a restriction we can't safely undo.
-    const appliedRestrictions: Array<{ path: string; backupFile: string }> = [];
+    // Drop any path that is a descendant of another path already in the set:
+    // /T on the ancestor already recurses into it, so restricting both would
+    // process the same underlying files twice — the same class of
+    // save/deny/restore corruption fixed for symlinks above, just triggered
+    // by overlapping GEMINI_SANDBOX_FORBIDDEN_PATHS entries (e.g.
+    // "C:\secret;C:\secret\child") instead of a symlink.
+    const isPathUnderOrEqual = (child: string, parent: string): boolean => {
+      const c = child.toLowerCase();
+      const p = parent.toLowerCase();
+      return c === p || c.startsWith(`${p}\\`) || c.startsWith(`${p}/`);
+    };
+    const allResolvedPaths = [...resolvedPaths];
+    const pathsToRestrict = allResolvedPaths.filter(
+      (p) =>
+        !allResolvedPaths.some(
+          (other) => other !== p && isPathUnderOrEqual(p, other),
+        ),
+    );
+
+    // Back up ACLs to a directory verified to sit outside every path we're
+    // about to restrict. Using os.tmpdir() here would be unsafe: if a
+    // forbidden path is (or is an ancestor of) the temp directory, the
+    // backup file would land inside the very tree the DENY ACE below
+    // recurses over, locking this same user out of the backup needed to
+    // undo it.
+    const backupDir = path.join(USER_SETTINGS_DIR, 'sandbox-acl-backups');
+    const backupDirIsRestricted = pathsToRestrict.some((p) =>
+      isPathUnderOrEqual(backupDir, p),
+    );
+    if (backupDirIsRestricted) {
+      throw new FatalSandboxError(
+        `Cannot start windows-native sandbox: '${USER_SETTINGS_DIR}' (or an ` +
+          'ancestor of it) is listed in GEMINI_SANDBOX_FORBIDDEN_PATHS, which ' +
+          'would prevent safely backing up and restoring ACLs. Remove it from ' +
+          'the forbidden paths list.',
+      );
+    }
+    try {
+      fs.mkdirSync(backupDir, { recursive: true });
+    } catch {
+      throw new FatalSandboxError(
+        `Failed to create ACL backup directory at ${backupDir}`,
+      );
+    }
+
+    // Snapshot ALL paths first, before denying ANY of them. Interleaving
+    // save+deny per path (as before) meant that for overlapping paths, a
+    // later path's snapshot could already reflect an earlier path's DENY —
+    // and since restores replay in the same order, the corrupted
+    // (already-denied) snapshot would be restored last, leaving the DENY ACE
+    // stuck after "cleanup". Two-phase processing ensures every snapshot
+    // reflects the true pre-sandbox state regardless of processing order.
+    const snapshots: Array<{ path: string; backupFile: string }> = [];
     for (const restrictedPath of pathsToRestrict) {
       const backupFile = path.join(
-        os.tmpdir(),
-        `gemini-acl-backup-${randomBytes(8).toString('hex')}.txt`,
+        backupDir,
+        `${randomBytes(8).toString('hex')}.acl`,
       );
       try {
         execSync(`icacls "${restrictedPath}" /save "${backupFile}" /T /Q`, {
           stdio: 'pipe',
         });
+        snapshots.push({ path: restrictedPath, backupFile });
       } catch {
         console.warn(
           `Warning: Could not snapshot ACLs for ${restrictedPath}; skipping restriction.`,
         );
-        continue;
       }
+    }
+
+    // Now apply DENY for every successfully-snapshotted path. The backup is
+    // recorded for restore BEFORE calling /deny (not after), so that even if
+    // /deny throws partway through a recursive operation — some DENY ACEs
+    // may already have been applied to a subset of files before the
+    // error — we still attempt to restore from the snapshot taken above
+    // rather than silently discarding it.
+    const appliedRestrictions: Array<{ path: string; backupFile: string }> = [];
+    for (const { path: restrictedPath, backupFile } of snapshots) {
+      appliedRestrictions.push({ path: restrictedPath, backupFile });
       try {
         execSync(
           `icacls "${restrictedPath}" /deny "${currentUser}:(OI)(CI)F" /T /Q`,
           { stdio: 'pipe' },
         );
-        appliedRestrictions.push({ path: restrictedPath, backupFile });
         console.error(`Restricted access to: ${restrictedPath}`);
       } catch {
         console.warn(
-          `Warning: Could not apply ACL restriction to ${restrictedPath}`,
+          `Warning: Could not fully apply ACL restriction to ${restrictedPath}. ` +
+            'Will still attempt to restore any partially-applied changes on exit.',
         );
       }
     }

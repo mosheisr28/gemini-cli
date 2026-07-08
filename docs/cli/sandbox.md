@@ -189,6 +189,14 @@ export SANDBOX_SET_UID_GID=false  # Disable UID/GID mapping
 | ---------------------- | ------------------------------------------ |
 | `GEMINI_LXC_CONTAINER` | LXC container name (default: `gemini-cli`) |
 
+The LXC sandbox mounts your workspace directory (and any `--include-directories`
+paths, read-write — matching how the edit tool and macOS Seatbelt profile treat
+them), plus your `~/.gemini` credential store, `~/.config/gcloud`, and
+Application Default Credentials file (if set), at the same absolute paths they
+have on the host. `HOME` is forwarded to the container explicitly, since
+`lxc exec` runs as root by default and Gemini resolves its credential directory
+from `os.homedir()`.
+
 ## Windows Native (TrusteeOS) configuration
 
 | Variable                         | Description                                         |
@@ -207,6 +215,16 @@ so restricting the real target already blocks access through the symlink, the
 real path itself, or any other symlink pointing at the same target. This
 mirrors, at a smaller scope, the symlink-resolution approach used for the
 workspace-trust boundary in other sandbox backends.
+
+If two forbidden paths overlap (e.g. a directory and one of its subdirectories),
+only the ancestor is restricted, since `icacls`'s `/T` flag already recurses
+into it. Before any path is restricted, its current ACLs are snapshotted to a
+backup file under `~/.gemini/sandbox-acl-backups`; all snapshots are taken
+before any `DENY` is applied, and restoring replays each snapshot exactly rather
+than blanket-removing deny rules. Startup fails with a clear error if
+`~/.gemini` itself (or an ancestor of it) is listed in
+`GEMINI_SANDBOX_FORBIDDEN_PATHS`, since that would trap the backups needed to
+restore the sandbox's own restrictions.
 
 ## Troubleshooting
 
