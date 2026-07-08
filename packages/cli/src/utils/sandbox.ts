@@ -799,8 +799,12 @@ export async function start_sandbox(
     let sandboxProcess: ChildProcess | undefined = undefined;
 
     if (proxyCommand) {
-      // run proxyCommand in its own container
-      const proxyContainerCommand = `${containerCommand} run --rm --init ${userFlag} --name ${SANDBOX_PROXY_NAME} --network ${SANDBOX_PROXY_NAME} -p 8877:8877 -v ${process.cwd()}:${workdir} --workdir ${workdir} ${image} ${proxyCommand}`;
+      // run proxyCommand in its own container. Include the same
+      // --runtime=runsc flag as the main sandbox container so the proxy
+      // isn't left running under Docker's default runtime when the user
+      // requested gVisor isolation.
+      const runtimeFlag = config.command === 'runsc' ? '--runtime=runsc ' : '';
+      const proxyContainerCommand = `${containerCommand} run --rm --init ${runtimeFlag}${userFlag} --name ${SANDBOX_PROXY_NAME} --network ${SANDBOX_PROXY_NAME} -p 8877:8877 -v ${process.cwd()}:${workdir} --workdir ${workdir} ${image} ${proxyCommand}`;
       proxyProcess = spawn(proxyContainerCommand, {
         stdio: ['ignore', 'pipe', 'pipe'],
         shell: true,
@@ -1101,6 +1105,84 @@ async function start_lxc_sandbox(
       }
     }
 
+    // Mount credential material so Login with Google / Application Default
+    // Credentials work inside the container, matching what the Docker path
+    // mounts. LXC devices mount at the exact `path=` given (no path
+    // translation like Docker's container filesystem), so mounting at the
+    // same absolute host path lets the in-container gemini process find
+    // these the same way it would on the host.
+    if (fs.existsSync(USER_SETTINGS_DIR)) {
+      const settingsDeviceName = `gemini-settings-${randomBytes(4).toString('hex')}`;
+      try {
+        execFileSync('lxc', [
+          'config',
+          'device',
+          'add',
+          containerName,
+          settingsDeviceName,
+          'disk',
+          `source=${USER_SETTINGS_DIR}`,
+          `path=${USER_SETTINGS_DIR}`,
+        ]);
+        mountedDirs.push(settingsDeviceName);
+      } catch {
+        console.warn(
+          `Warning: Could not mount ${USER_SETTINGS_DIR} into LXC container`,
+        );
+      }
+    }
+
+    const gcloudConfigDir = path.join(os.homedir(), '.config', 'gcloud');
+    if (fs.existsSync(gcloudConfigDir)) {
+      const gcloudDeviceName = `gemini-gcloud-${randomBytes(4).toString('hex')}`;
+      try {
+        execFileSync('lxc', [
+          'config',
+          'device',
+          'add',
+          containerName,
+          gcloudDeviceName,
+          'disk',
+          `source=${gcloudConfigDir}`,
+          `path=${gcloudConfigDir}`,
+          'readonly=true',
+        ]);
+        mountedDirs.push(gcloudDeviceName);
+      } catch {
+        console.warn(
+          `Warning: Could not mount ${gcloudConfigDir} into LXC container`,
+        );
+      }
+    }
+
+    let adcFile: string | undefined;
+    if (process.env['GOOGLE_APPLICATION_CREDENTIALS']) {
+      adcFile = process.env['GOOGLE_APPLICATION_CREDENTIALS'];
+      if (fs.existsSync(adcFile)) {
+        const adcDeviceName = `gemini-adc-${randomBytes(4).toString('hex')}`;
+        try {
+          execFileSync('lxc', [
+            'config',
+            'device',
+            'add',
+            containerName,
+            adcDeviceName,
+            'disk',
+            `source=${adcFile}`,
+            `path=${adcFile}`,
+            'readonly=true',
+          ]);
+          mountedDirs.push(adcDeviceName);
+        } catch {
+          console.warn(
+            `Warning: Could not mount ${adcFile} into LXC container`,
+          );
+        }
+      } else {
+        adcFile = undefined;
+      }
+    }
+
     // Clean up mounts on exit
     const cleanupMounts = () => {
       for (const device of mountedDirs) {
@@ -1124,7 +1206,9 @@ async function start_lxc_sandbox(
     // command instead of as flags to `lxc exec` itself.
     const args = ['exec', containerName];
 
-    // Forward environment variables
+    // Forward environment variables. GOOGLE_APPLICATION_CREDENTIALS is
+    // forwarded unchanged (not translated, unlike the Docker path) since the
+    // ADC file above was mounted at the same absolute path it has on the host.
     const envVars: Record<string, string | undefined> = {
       GEMINI_API_KEY: process.env['GEMINI_API_KEY'],
       GOOGLE_API_KEY: process.env['GOOGLE_API_KEY'],
@@ -1133,6 +1217,7 @@ async function start_lxc_sandbox(
       GOOGLE_CLOUD_PROJECT: process.env['GOOGLE_CLOUD_PROJECT'],
       GOOGLE_CLOUD_LOCATION: process.env['GOOGLE_CLOUD_LOCATION'],
       GEMINI_MODEL: process.env['GEMINI_MODEL'],
+      GOOGLE_APPLICATION_CREDENTIALS: adcFile,
       SANDBOX: 'lxc',
     };
 
@@ -1228,29 +1313,37 @@ async function start_windows_native_sandbox(
       .map((p) => p.trim())
       .filter(Boolean);
 
-    // Resolve symlinks before restricting: icacls acts on the path it is
-    // given, so restricting only a symlink leaves its real target (and any
-    // other symlink pointing at that same target) fully accessible. Restrict
-    // both the literal path and its resolved real path so a symlink cannot
-    // be used to bypass the DENY ACE.
+    // Resolve symlinks before restricting: without /L, icacls follows a
+    // symlink/junction to operate on its real target, so restricting the
+    // literal (symlinked) path already restricts the underlying data — any
+    // other symlink pointing at that same real path inherits the same
+    // restriction, since the ACL lives on the real object, not the link.
+    //
+    // We therefore restrict ONLY the resolved real path per forbidden entry
+    // (deduped via the Set), rather than also separately restricting the
+    // literal symlink path. Restricting both would process the same
+    // underlying object twice: the first pass's DENY would already be
+    // reflected in the ACL that the second pass's /save snapshots, so the
+    // second pass's later /restore would replay that already-denied
+    // snapshot last and leave the DENY ACE stuck after "cleanup".
     const pathsToRestrict = new Set<string>();
     for (const forbiddenPath of forbiddenPaths) {
       if (!fs.existsSync(forbiddenPath)) {
         continue;
       }
-      pathsToRestrict.add(forbiddenPath);
       try {
         const realPath = fs.realpathSync(forbiddenPath);
         if (realPath !== forbiddenPath) {
           console.error(
-            `Note: '${forbiddenPath}' resolves to '${realPath}'; restricting both paths.`,
+            `Note: '${forbiddenPath}' resolves to '${realPath}'; restricting the resolved path.`,
           );
-          pathsToRestrict.add(realPath);
         }
+        pathsToRestrict.add(realPath);
       } catch {
         console.warn(
-          `Warning: Could not resolve real path for ${forbiddenPath}`,
+          `Warning: Could not resolve real path for ${forbiddenPath}; restricting the literal path instead.`,
         );
+        pathsToRestrict.add(forbiddenPath);
       }
     }
 
@@ -1298,14 +1391,29 @@ async function start_windows_native_sandbox(
           execSync(`icacls "${restrictedPath}" /restore "${backupFile}" /Q`, {
             stdio: 'pipe',
           });
-        } catch {
-          // ignore cleanup errors
-        } finally {
-          try {
-            fs.unlinkSync(backupFile);
-          } catch {
-            // ignore cleanup errors
+        } catch (err) {
+          // Surface this instead of failing silently: if /restore doesn't
+          // succeed, the DENY ACE applied above may still be in effect on
+          // ${restrictedPath} after this process exits (e.g. this has only
+          // been validated against directory paths — /restore behavior for
+          // an individual forbidden *file* has not been confirmed on real
+          // Windows). Leave the backup file in place in that case so the
+          // restriction can still be undone manually with
+          // `icacls "${restrictedPath}" /restore "${backupFile}" /Q`.
+          console.warn(
+            `Warning: Failed to restore ACLs for ${restrictedPath}. ` +
+              `It may still have a DENY restriction applied. To restore ` +
+              `manually, run: icacls "${restrictedPath}" /restore "${backupFile}" /Q`,
+          );
+          if (err instanceof Error) {
+            console.warn(err.message);
           }
+          continue;
+        }
+        try {
+          fs.unlinkSync(backupFile);
+        } catch {
+          // ignore cleanup errors for the now-unneeded backup file
         }
       }
     };

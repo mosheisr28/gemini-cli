@@ -123,15 +123,16 @@ export async function parseArguments(settings: Settings): Promise<CliArgs> {
         })
         .option('sandbox', {
           alias: 's',
-          // No explicit `type` here: this flag is boolean-or-string. Bare
-          // `-s`/`--sandbox` (or followed by another flag) is treated as
-          // `true`; `--sandbox docker`/`runsc`/`lxc`/`windows-native` selects
-          // a specific backend. Declaring `type: 'boolean'` would force
-          // yargs to always coerce to a boolean and leave the backend name
-          // as a stray positional argument instead of this option's value.
-          description:
-            'Run in sandbox? Pass a backend name (docker, podman, ' +
-            'sandbox-exec, runsc, lxc, windows-native) to select one explicitly.',
+          // Must stay `type: 'boolean'`: this command also accepts a
+          // positional query (`$0 [query..]`, e.g. `gemini -s "do X"`), and
+          // an untyped/string option here would greedily consume that
+          // positional as the flag's value instead of leaving it for the
+          // query, breaking `-s <prompt>` with no other flags.
+          // To select a specific backend (docker, podman, sandbox-exec,
+          // runsc, lxc, windows-native), use the GEMINI_SANDBOX environment
+          // variable or the `tools.sandbox` setting instead of a CLI value.
+          type: 'boolean',
+          description: 'Run in sandbox?',
         })
 
         .option('yolo', {

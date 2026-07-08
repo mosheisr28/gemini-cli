@@ -59,7 +59,8 @@ intercepts and handles system calls in user space for stronger isolation.
 configured as a Docker runtime.
 
 ```bash
-gemini --sandbox runsc -p "analyze the code"
+export GEMINI_SANDBOX=runsc
+gemini -p "analyze the code"
 ```
 
 ### 4. LXC (Linux Containers)
@@ -78,7 +79,8 @@ lxc exec gemini-cli -- npm install -g @google/gemini-cli
 
 # Run with LXC sandbox
 export GEMINI_LXC_CONTAINER=gemini-cli
-gemini --sandbox lxc -p "run the tests"
+export GEMINI_SANDBOX=lxc
+gemini -p "run the tests"
 ```
 
 ### 5. Windows Native / TrusteeOS (Windows only)
@@ -93,16 +95,18 @@ requiring a container runtime.
 ```bash
 # Restrict access to specific paths
 set GEMINI_SANDBOX_FORBIDDEN_PATHS=C:\Users\secret;C:\sensitive-data
-gemini --sandbox windows-native -p "analyze the code"
+set GEMINI_SANDBOX=windows-native
+gemini -p "analyze the code"
 ```
 
-**Symlink resolution**: Each forbidden path is resolved with `fs.realpathSync`
-before the `DENY` ACE is applied. If a forbidden path is a symlink (or
-junction/reparse point), both the symlink itself **and** its real target are
-restricted — this prevents a symlink from being used to reach the same
-underlying file or directory without triggering the restriction. See
-[Security notes](#security-notes) for the current scope and known limitations of
-this protection.
+**Symlink resolution**: Each forbidden path is resolved to its real path with
+`fs.realpathSync` before the `DENY` ACE is applied, and the restriction is
+applied to that resolved path. If a forbidden path is a symlink (or
+junction/reparse point), the underlying real target is restricted rather than
+the link itself — icacls follows links by default, so this closes off access via
+the symlink, the real path, or any other symlink pointing at the same target.
+See [Security notes](#security-notes) for the current scope and known
+limitations of this protection.
 
 ## Quickstart
 
@@ -126,11 +130,17 @@ gemini -p "run the test suite"
 
 ### Enable sandboxing (in order of precedence)
 
-1. **Command flag**: `-s` or `--sandbox`
+1. **Command flag**: `-s`/`--sandbox` — a boolean switch only (auto-detects a
+   backend: sandbox-exec on macOS, otherwise docker/podman). It cannot select a
+   specific backend by name, since this command also accepts a positional query
+   (e.g. `gemini -s "do X"`) and a value-accepting flag here would swallow that
+   query instead of leaving it as the prompt.
 2. **Environment variable**:
-   `GEMINI_SANDBOX=true|docker|podman|sandbox-exec|runsc|lxc|windows-native`
-3. **Settings file**: `"sandbox": true` in the `tools` object of your
-   `settings.json` file (e.g., `{"tools": {"sandbox": true}}`).
+   `GEMINI_SANDBOX=true|docker|podman|sandbox-exec|runsc|lxc|windows-native` —
+   the only way to select `runsc`, `lxc`, or `windows-native` explicitly.
+3. **Settings file**: `"sandbox": true` (or a specific backend name string) in
+   the `tools` object of your `settings.json` file (e.g.,
+   `{"tools": {"sandbox": "lxc"}}`).
 
 ### macOS Seatbelt profiles
 
@@ -190,10 +200,12 @@ specified paths using `icacls.exe`. Restrictions are automatically removed when
 the session ends.
 
 Before applying a restriction, each forbidden path is resolved with
-`fs.realpathSync`. If the resolved real path differs from the path you specified
-(i.e. it is a symlink or junction), the sandbox restricts **both** paths, so
-pointing a symlink at a forbidden directory does not bypass the restriction.
-This mirrors, at a smaller scope, the symlink-resolution approach used for the
+`fs.realpathSync`, and the restriction is applied to the resolved path. If the
+resolved real path differs from the path you specified (i.e. it is a symlink or
+junction), only the real target is restricted — icacls follows links by default,
+so restricting the real target already blocks access through the symlink, the
+real path itself, or any other symlink pointing at the same target. This
+mirrors, at a smaller scope, the symlink-resolution approach used for the
 workspace-trust boundary in other sandbox backends.
 
 ## Troubleshooting

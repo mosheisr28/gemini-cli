@@ -13,6 +13,7 @@ import fs from 'node:fs';
 import type { Config, SandboxConfig } from '@google/gemini-cli-core';
 import { FatalSandboxError } from '@google/gemini-cli-core';
 import { start_sandbox } from './sandbox.js';
+import { USER_SETTINGS_DIR } from '../config/settings.js';
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
@@ -292,6 +293,73 @@ describe('start_sandbox', () => {
         expect.arrayContaining([`source=${spacedWorkdir}`]),
       );
     });
+
+    it('mounts credential material and forwards GOOGLE_APPLICATION_CREDENTIALS', async () => {
+      mockRunningContainer();
+      const adcFile = '/home/user/.config/adc.json';
+      mockExistsSync.mockImplementation(
+        (p) =>
+          p === USER_SETTINGS_DIR ||
+          p === '/home/user/.config/gcloud' ||
+          p === adcFile,
+      );
+      vi.stubEnv('GOOGLE_APPLICATION_CREDENTIALS', adcFile);
+
+      const fakeChild = createFakeChildProcess();
+      mockSpawn.mockReturnValue(fakeChild);
+
+      const resultPromise = start_sandbox(lxcConfig, [], undefined, CLI_ARGS);
+      fakeChild.emit('close', 0);
+      await resultPromise;
+
+      // Credential store (~/.gemini) is mounted so cached OAuth tokens are
+      // available inside the container, matching the Docker sandbox path.
+      expect(mockExecFileSync).toHaveBeenCalledWith(
+        'lxc',
+        expect.arrayContaining([`source=${USER_SETTINGS_DIR}`]),
+      );
+      // gcloud config directory is mounted read-only.
+      expect(mockExecFileSync).toHaveBeenCalledWith(
+        'lxc',
+        expect.arrayContaining([
+          'source=/home/user/.config/gcloud',
+          'readonly=true',
+        ]),
+      );
+      // The ADC file is mounted read-only at the same path...
+      expect(mockExecFileSync).toHaveBeenCalledWith(
+        'lxc',
+        expect.arrayContaining([`source=${adcFile}`, 'readonly=true']),
+      );
+      // ...and forwarded to the container unchanged (no path translation,
+      // unlike the Docker sandbox path).
+      const spawnArgs = mockSpawn.mock.calls.find(
+        ([cmd]) => cmd === 'lxc',
+      )?.[1] as string[];
+      expect(spawnArgs).toContain(`GOOGLE_APPLICATION_CREDENTIALS=${adcFile}`);
+      vi.unstubAllEnvs();
+    });
+
+    it('does not forward GOOGLE_APPLICATION_CREDENTIALS when the ADC file does not exist', async () => {
+      mockRunningContainer();
+      mockExistsSync.mockReturnValue(false);
+      vi.stubEnv('GOOGLE_APPLICATION_CREDENTIALS', '/does/not/exist/adc.json');
+
+      const fakeChild = createFakeChildProcess();
+      mockSpawn.mockReturnValue(fakeChild);
+
+      const resultPromise = start_sandbox(lxcConfig, [], undefined, CLI_ARGS);
+      fakeChild.emit('close', 0);
+      await resultPromise;
+
+      const spawnArgs = mockSpawn.mock.calls.find(
+        ([cmd]) => cmd === 'lxc',
+      )?.[1] as string[];
+      expect(
+        spawnArgs.some((a) => a.startsWith('GOOGLE_APPLICATION_CREDENTIALS=')),
+      ).toBe(false);
+      vi.unstubAllEnvs();
+    });
   });
 
   describe('windows-native', () => {
@@ -439,6 +507,41 @@ describe('start_sandbox', () => {
       vi.unstubAllEnvs();
     });
 
+    it('warns (rather than silently swallowing) when the ACL restore itself fails, and keeps the backup file', async () => {
+      mockPlatform.mockReturnValue('win32');
+      mockExistsSync.mockReturnValue(true);
+      vi.stubEnv('GEMINI_SANDBOX_FORBIDDEN_PATHS', 'C:\\secret');
+      mockExecSync.mockImplementation((cmd) => {
+        const cmdStr = cmd as string;
+        if (cmdStr === 'whoami') {
+          return Buffer.from('DOMAIN\\user');
+        }
+        if (cmdStr.includes('/restore')) {
+          throw new Error('access denied');
+        }
+        return Buffer.from('');
+      });
+      const warnSpy = vi.spyOn(console, 'warn');
+
+      const fakeChild = createFakeChildProcess();
+      mockSpawn.mockReturnValue(fakeChild);
+
+      const resultPromise = start_sandbox(winConfig, [], undefined, CLI_ARGS);
+      fakeChild.emit('close', 0);
+      await resultPromise;
+
+      // The failure must be surfaced, not silently ignored.
+      expect(
+        warnSpy.mock.calls.some(
+          ([msg]) =>
+            typeof msg === 'string' && msg.includes('Failed to restore ACLs'),
+        ),
+      ).toBe(true);
+      // The backup file must not be deleted when restore fails, so the
+      // restriction can still be undone manually.
+      expect(fs.unlinkSync).not.toHaveBeenCalled();
+    });
+
     it('does not restore ACLs immediately on SIGINT, only once the child actually closes', async () => {
       mockPlatform.mockReturnValue('win32');
       mockExistsSync.mockReturnValue(true);
@@ -490,7 +593,7 @@ describe('start_sandbox', () => {
     });
 
     describe('symlink defense', () => {
-      it('restricts both a symlinked forbidden path and its real target', async () => {
+      it('restricts the resolved real target, not the literal symlink path', async () => {
         mockPlatform.mockReturnValue('win32');
         mockExistsSync.mockImplementation((p) => p === 'C:\\secret-link');
         mockRealpathSync.mockImplementation((p) =>
@@ -511,24 +614,27 @@ describe('start_sandbox', () => {
         fakeChild.emit('close', 0);
         await resultPromise;
 
-        // The symlink itself is restricted...
-        expect(mockExecSync).toHaveBeenCalledWith(
-          expect.stringContaining(
-            'icacls "C:\\secret-link" /deny "DOMAIN\\user:(OI)(CI)F" /T /Q',
-          ),
-          expect.anything(),
-        );
-        // ...and so is the real target it resolves to, closing the bypass.
+        // The real target is restricted, which — since icacls follows
+        // symlinks/junctions by default — closes off access via the
+        // symlink, the real path, or any other symlink pointing at the
+        // same target.
         expect(mockExecSync).toHaveBeenCalledWith(
           expect.stringContaining(
             'icacls "C:\\real-secret" /deny "DOMAIN\\user:(OI)(CI)F" /T /Q',
           ),
           expect.anything(),
         );
+        // The literal symlink path must NOT be separately restricted: doing
+        // so would process the same underlying object twice, corrupting the
+        // ACL snapshot used to restore it later (see the restore test below).
+        expect(mockExecSync).not.toHaveBeenCalledWith(
+          expect.stringContaining('icacls "C:\\secret-link"'),
+          expect.anything(),
+        );
         vi.unstubAllEnvs();
       });
 
-      it('snapshots and restores ACLs on both the symlink and its real target', async () => {
+      it('snapshots and restores ACLs on the resolved real target exactly once', async () => {
         mockPlatform.mockReturnValue('win32');
         mockExistsSync.mockReturnValue(true);
         mockRealpathSync.mockImplementation((p) =>
@@ -550,18 +656,18 @@ describe('start_sandbox', () => {
         await resultPromise;
 
         const calls = mockExecSync.mock.calls.map(([cmd]) => cmd as string);
-        expect(
-          calls.some((c) => c.startsWith('icacls "C:\\secret-link" /save')),
-        ).toBe(true);
-        expect(
-          calls.some((c) => c.startsWith('icacls "C:\\secret-link" /restore')),
-        ).toBe(true);
-        expect(
-          calls.some((c) => c.startsWith('icacls "C:\\real-secret" /save')),
-        ).toBe(true);
-        expect(
-          calls.some((c) => c.startsWith('icacls "C:\\real-secret" /restore')),
-        ).toBe(true);
+        const saveCalls = calls.filter((c) =>
+          c.startsWith('icacls "C:\\real-secret" /save'),
+        );
+        const restoreCalls = calls.filter((c) =>
+          c.startsWith('icacls "C:\\real-secret" /restore'),
+        );
+        // Exactly one save/restore pair for the real target — processing it
+        // twice (once via the symlink, once via the real path) is what
+        // corrupted the snapshot and left the DENY ACE stuck after restore.
+        expect(saveCalls).toHaveLength(1);
+        expect(restoreCalls).toHaveLength(1);
+        expect(calls.some((c) => c.includes('C:\\secret-link'))).toBe(false);
         expect(calls.some((c) => c.includes('/remove:d'))).toBe(false);
         vi.unstubAllEnvs();
       });
